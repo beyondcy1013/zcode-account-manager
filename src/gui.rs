@@ -355,8 +355,9 @@ impl ZCodeApp {
 }
 
 impl eframe::App for ZCodeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.heading("ZCode 账户管家");
@@ -393,7 +394,7 @@ impl eframe::App for ZCodeApp {
             ui.add_space(8.0);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(10.0);
             match self.page {
                 Page::Accounts => self.accounts_page(ui),
@@ -401,7 +402,7 @@ impl eframe::App for ZCodeApp {
             }
         });
 
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        egui::Panel::bottom("status").show(ui, |ui| {
             ui.add_space(5.0);
             ui.colored_label(
                 if self.status_error {
@@ -413,7 +414,7 @@ impl eframe::App for ZCodeApp {
             );
             ui.add_space(5.0);
         });
-        self.confirmation_window(ctx);
+        self.confirmation_window(&ctx);
     }
 }
 
