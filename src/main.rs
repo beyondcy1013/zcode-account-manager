@@ -2,6 +2,7 @@
 
 use semver::Version;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::thread;
 use std::time::Duration;
 use std::{
@@ -10,12 +11,17 @@ use std::{
     fs, io,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::{Child, Command, ExitCode},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 mod accounts;
+mod auto_send;
 mod gui;
+mod identity;
+mod single_instance;
+mod tray;
 
 #[derive(Clone, Copy)]
 enum Root {
@@ -81,6 +87,21 @@ const CANDIDATES: &[Candidate] = &[
         root: Root::AppData,
         relative: "ZCode/.updaterId",
     },
+    Candidate {
+        tag: "provider_config",
+        root: Root::UserProfile,
+        relative: ".zcode/v2/config.json",
+    },
+    Candidate {
+        tag: "app_settings",
+        root: Root::UserProfile,
+        relative: ".zcode/v2/setting.json",
+    },
+    Candidate {
+        tag: "cli_config",
+        root: Root::UserProfile,
+        relative: ".zcode/cli/config.json",
+    },
 ];
 const SAFE_TAGS: &[&str] = &["plan_cache", "session_cookies", "telemetry"];
 const FULL_TAGS: &[&str] = &[
@@ -91,12 +112,48 @@ const FULL_TAGS: &[&str] = &[
     "session_full",
     "electron_store",
     "updater_id",
+    "provider_config",
+    "app_settings",
+    "cli_config",
 ];
+/// 后期才纳入备份的配置项。旧版本快照里没有它们，恢复时若快照缺失应保留本机
+/// 现状而不是删除，否则用旧备份切换会把整机 provider 配置清空。
+const PRESERVE_IF_ABSENT_TAGS: &[&str] = &["provider_config", "app_settings", "cli_config"];
+
+#[derive(Default)]
+struct AutoSendArgs {
+    pinned: usize,
+    message: String,
+    dry_run: bool,
+    at: Option<String>,
+    daily: bool,
+}
 
 #[derive(Clone)]
 struct Roots {
     user_profile: PathBuf,
     app_data: PathBuf,
+}
+
+/// Electron 应用数据根目录（ZCode 子目录的上层）。
+/// Windows 回退 `%USERPROFILE%\AppData\Roaming`，macOS 为 `~/Library/Application Support`，
+/// Linux 为 `$XDG_CONFIG_HOME`（缺省 `~/.config`，ZCode 桌面端实际位于 `~/.config/ZCode`）。
+fn default_app_data_root(user_profile: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        user_profile.join("Library").join("Application Support")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        user_profile.join("AppData").join("Roaming")
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|value| value.is_absolute())
+            .unwrap_or_else(|| user_profile.join(".config"))
+    }
 }
 
 impl Roots {
@@ -107,7 +164,7 @@ impl Roots {
             .ok_or("未找到 USERPROFILE 环境变量")?;
         let app_data = env::var_os("APPDATA")
             .map(PathBuf::from)
-            .unwrap_or_else(|| user_profile.join("AppData").join("Roaming"));
+            .unwrap_or_else(|| default_app_data_root(&user_profile));
         Ok(Self {
             user_profile,
             app_data,
@@ -132,11 +189,19 @@ struct CleanOptions {
     backup_dir: Option<PathBuf>,
 }
 enum Action {
-    Gui,
+    Gui { start_hidden: bool },
     InteractiveCli,
     Inspect,
+    Whoami,
     Backup(Option<PathBuf>),
     Clean(CleanOptions),
+    AutoSend {
+        pinned: usize,
+        message: String,
+        dry_run: bool,
+        at: Option<String>,
+        daily: bool,
+    },
     Help,
     Version,
     CheckUpdate,
@@ -171,7 +236,7 @@ fn tr(zh: &str, en: &str) -> String {
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Action, String> {
     let mut args = args.into_iter();
     let Some(action) = args.next() else {
-        return Ok(Action::Gui);
+        return Ok(Action::Gui { start_hidden: false });
     };
     if ["--help", "-h"].contains(&action.as_str()) {
         return Ok(Action::Help);
@@ -182,7 +247,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Action, String> 
     if action == "--check-update" {
         return Ok(Action::CheckUpdate);
     }
+    if action == "--hidden" {
+        // 随桌面自启动时使用：启动后隐藏到系统托盘
+        return Ok(Action::Gui { start_hidden: true });
+    }
     let mut options = CleanOptions::default();
+    let mut auto_send = AutoSendArgs::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--safe" if action == "clean" => options.safe = true,
@@ -192,15 +262,102 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Action, String> 
                     args.next().ok_or("--backup-dir 缺少目录参数")?,
                 ));
             }
+            "--pinned" if action == "send" => {
+                let value = args.next().ok_or("--pinned 缺少序号参数")?;
+                auto_send.pinned = value.parse().map_err(|_| "--pinned 需要正整数序号")?;
+            }
+            "--message" if action == "send" => {
+                auto_send.message = args.next().ok_or("--message 缺少消息内容")?;
+            }
+            "--dry-run" if action == "send" => auto_send.dry_run = true,
+            "--at" if action == "send" => {
+                auto_send.at = Some(args.next().ok_or("--at 缺少时间参数（HH:MM）")?);
+            }
+            "--daily" if action == "send" => auto_send.daily = true,
             _ => return Err(format!("未知参数: {arg}")),
         }
     }
     match action.as_str() {
         "interactive" => Ok(Action::InteractiveCli),
         "inspect" => Ok(Action::Inspect),
+        "--whoami" => Ok(Action::Whoami),
         "backup" => Ok(Action::Backup(options.backup_dir)),
         "clean" => Ok(Action::Clean(options)),
+        "send" => {
+            if auto_send.pinned == 0 {
+                return Err("send 命令需要 --pinned 提供置顶会话序号".into());
+            }
+            if !auto_send.dry_run && auto_send.message.is_empty() {
+                return Err("send 命令需要 --message 提供非空消息内容".into());
+            }
+            if auto_send.daily && auto_send.at.is_none() {
+                return Err("--daily 需要与 --at 搭配使用".into());
+            }
+            Ok(Action::AutoSend {
+                pinned: auto_send.pinned,
+                message: auto_send.message,
+                dry_run: auto_send.dry_run,
+                at: auto_send.at,
+                daily: auto_send.daily,
+            })
+        }
         _ => Err(format!("未知命令: {action}")),
+    }
+}
+
+/// 桌面客户端进程名：Linux 上桌面端可执行名为 ZCode（Windows 分支直接使用 ZCode.exe）。
+/// 注意不要用 -f 全命令行匹配，否则会误杀 zcode CLI 与本工具自身。
+#[cfg(not(windows))]
+const DESKTOP_PROCESS_NAME: &str = "ZCode";
+
+/// 结束 ZCode 前记录的桌面客户端可执行文件路径；关闭后只有它知道该重启哪个程序。
+static REMEMBERED_ZCODE_EXE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// 探测正在运行的 ZCode 桌面客户端的真实可执行文件路径。
+#[cfg(not(windows))]
+fn detect_zcode_desktop_exe() -> Option<PathBuf> {
+    let output = Command::new("pgrep")
+        .args(["-x", DESKTOP_PROCESS_NAME])
+        .output()
+        .ok()?;
+    for pid in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+        let Ok(link) = fs::read_link(format!("/proc/{pid}/exe")) else {
+            continue;
+        };
+        // 进程所属文件被替换时 readlink 会带 " (deleted)" 后缀
+        let mut path = link.to_string_lossy().to_string();
+        if let Some(real) = path.strip_suffix(" (deleted)") {
+            path = real.to_string();
+        }
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Windows 上用 PowerShell 查询 ZCode.exe 的真实路径。
+#[cfg(windows)]
+fn detect_zcode_desktop_exe() -> Option<PathBuf> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-Process -Name ZCode -ErrorAction SilentlyContinue | Select-Object -First 1).Path",
+        ])
+        .output()
+        .ok()?;
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if path.is_file() { Some(path) } else { None }
+}
+
+/// 在结束 ZCode 之前调用，否则进程关闭后就无从得知桌面端装在哪里。
+fn remember_zcode_desktop_exe() {
+    if let Some(path) = detect_zcode_desktop_exe() {
+        if let Ok(mut slot) = REMEMBERED_ZCODE_EXE.lock() {
+            *slot = Some(path);
+        }
     }
 }
 
@@ -217,7 +374,8 @@ fn zcode_running() -> bool {
         .unwrap_or(false);
     #[cfg(not(windows))]
     return Command::new("pgrep")
-        .args(["-i", "-x", "zcode"])
+        .arg("-x")
+        .arg(DESKTOP_PROCESS_NAME)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -303,19 +461,12 @@ fn install_update(update: &UpdateManifest) -> Result<(), String> {
         return Err(tr("下载更新失败", "update download failed"));
     }
     if let Some(expected) = &update.sha256 {
-        let output = Command::new("certutil")
-            .arg("-hashfile")
-            .arg(&next)
-            .arg("SHA256")
-            .output()
-            .map_err(|error| error.to_string())?;
-        let hash_output = String::from_utf8_lossy(&output.stdout);
-        let actual = hash_output
-            .lines()
-            .map(str::trim)
-            .find(|line| line.len() == 64)
-            .unwrap_or("")
-            .to_string();
+        // 直接用内置 sha2 计算，避免依赖平台专用的 certutil/shasum
+        let bytes = fs::read(&next).map_err(|error| error.to_string())?;
+        let actual: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         if !actual.eq_ignore_ascii_case(expected) {
             let _ = fs::remove_file(&next);
             return Err(tr(
@@ -334,6 +485,24 @@ fn install_update(update: &UpdateManifest) -> Result<(), String> {
             .spawn()
             .map_err(|error| error.to_string())?;
     }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&next, fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+        // Linux 允许把新文件重命名到正在运行的程序路径上，替换后启动新版本
+        fs::rename(&next, &current).map_err(|error| error.to_string())?;
+        let mut command = Command::new(&current);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        use std::os::unix::process::CommandExt;
+        let _ = command.process_group(0);
+        command
+            .spawn()
+            .map_err(|error| error.to_string())?;
+    }
     println!(
         "{}",
         tr(
@@ -345,6 +514,7 @@ fn install_update(update: &UpdateManifest) -> Result<(), String> {
 }
 
 fn terminate_zcode() -> Result<(), String> {
+    remember_zcode_desktop_exe();
     println!("[步骤 2/4] 正在强行结束 ZCode 进程...");
     #[cfg(windows)]
     let result = Command::new("taskkill")
@@ -352,7 +522,7 @@ fn terminate_zcode() -> Result<(), String> {
         .output();
     #[cfg(not(windows))]
     let result = Command::new("pkill")
-        .args(["-TERM", "-f", "zcode"])
+        .args(["-TERM", "-x", DESKTOP_PROCESS_NAME])
         .output();
     match result {
         Ok(output) if output.status.success() || !zcode_running() => {
@@ -363,6 +533,19 @@ fn terminate_zcode() -> Result<(), String> {
                 }
                 thread::sleep(Duration::from_millis(500));
             }
+            #[cfg(not(windows))]
+            {
+                let _ = Command::new("pkill")
+                    .args(["-KILL", "-x", DESKTOP_PROCESS_NAME])
+                    .output();
+                for _ in 0..6 {
+                    if !zcode_running() {
+                        println!("[完成] ZCode 进程已结束。");
+                        return Ok(());
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
             Err("强行结束后仍检测到 ZCode 进程，请手动结束后重试".into())
         }
         Ok(output) => Err(format!(
@@ -371,6 +554,180 @@ fn terminate_zcode() -> Result<(), String> {
         )),
         Err(error) => Err(format!("调用进程结束命令失败: {error}")),
     }
+}
+
+/// 启动 ZCode 桌面客户端。优先使用环境变量 ZCODE_APP_PATH，其次使用结束前
+/// 记录的真实路径，最后探测常见安装位置。确认进程稳定存活后才算成功。
+pub fn launch_zcode() -> Result<(), String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(path) = env::var_os("ZCODE_APP_PATH") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Ok(slot) = REMEMBERED_ZCODE_EXE.lock() {
+        if let Some(path) = slot.clone() {
+            candidates.push(path);
+        }
+    }
+    if let Some(path) = detect_zcode_desktop_exe() {
+        candidates.push(path);
+    }
+    #[cfg(windows)]
+    {
+        if let Some(local) = env::var_os("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            candidates.push(local.join("Programs").join("ZCode").join("ZCode.exe"));
+            candidates.push(local.join("ZCode").join("ZCode.exe"));
+        }
+        for base in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(dir) = env::var_os(base) {
+                candidates.push(PathBuf::from(dir).join("ZCode").join("ZCode.exe"));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        for path in [
+            "/usr/bin/ZCode",
+            "/usr/local/bin/ZCode",
+            "/opt/ZCode/zcode",
+            "/opt/ZCode/ZCode",
+        ] {
+            candidates.push(PathBuf::from(path));
+        }
+    }
+    let executable = candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or("未找到 ZCode 客户端程序，可设置环境变量 ZCODE_APP_PATH 指向 ZCode 主程序后重试")?;
+
+    // 桌面入口可能带有必需参数（本机 root 下必须 --no-sandbox，否则 Electron
+    // 沙盒检查会直接 FATAL），重启时必须沿用与正常双击启动相同的参数
+    let extra_args = desktop_entry_args(&executable).unwrap_or_default();
+    let mut child = match spawn_zcode(&executable, &extra_args) {
+        Ok(child) => child,
+        Err(error) => {
+            if extra_args.is_empty() && running_as_root() {
+                spawn_zcode(&executable, &["--no-sandbox".to_string()])?
+            } else {
+                return Err(error);
+            }
+        }
+    };
+    // 由后台线程回收子进程，避免残留僵尸进程干扰后续 pgrep 检测
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// 启动并确认进程短期稳定存活，避免出现"提示已启动但实际秒退"。
+fn spawn_zcode(executable: &Path, args: &[String]) -> Result<Child, String> {
+    let mut command = Command::new(executable);
+    command.args(args);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(DETACHED_PROCESS);
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::process::CommandExt;
+        let _ = command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("启动 ZCode 失败 ({}): {error}", executable.display()))?;
+    for _ in 0..12 {
+        thread::sleep(Duration::from_millis(250));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = child.wait();
+                return Err(format!(
+                    "ZCode 启动后立即退出（{status}），可设置 ZCODE_APP_PATH 指向正确的桌面客户端后重试"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.wait();
+                return Err(format!("无法确认 ZCode 启动状态: {error}"));
+            }
+        }
+    }
+    Ok(child)
+}
+
+/// 在 XDG 应用目录中查找 Exec 指向该可执行文件的 .desktop 桌面入口，
+/// 提取其启动参数（跳过可执行文件本身和 %U 等字段代码）。
+#[cfg(not(windows))]
+fn desktop_entry_args(executable: &Path) -> Option<Vec<String>> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".local/share/applications"));
+    }
+    if let Some(data_dirs) = env::var_os("XDG_DATA_DIRS") {
+        for dir in env::split_paths(&data_dirs) {
+            dirs.push(dir.join("applications"));
+        }
+    } else {
+        dirs.push(PathBuf::from("/usr/local/share/applications"));
+        dirs.push(PathBuf::from("/usr/share/applications"));
+    }
+    let target = fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("desktop") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(exec_line) = text.lines().find_map(|line| line.strip_prefix("Exec=")) else {
+                continue;
+            };
+            let mut tokens = exec_line.split_whitespace();
+            let first = tokens.next()?.trim_matches('"');
+            let first_path = PathBuf::from(first);
+            let first_canon = fs::canonicalize(&first_path).unwrap_or(first_path);
+            if first_canon != target {
+                continue;
+            }
+            let args: Vec<String> = tokens
+                .filter(|token| !token.starts_with('%'))
+                .map(str::to_string)
+                .collect();
+            return Some(args);
+        }
+    }
+    None
+}
+
+/// Windows 没有 .desktop 桌面入口文件，无需沿用启动参数。
+#[cfg(windows)]
+fn desktop_entry_args(_executable: &Path) -> Option<Vec<String>> {
+    None
+}
+
+/// 桌面端是否以 root 身份运行（root 下 Electron 必须 --no-sandbox 才能启动）。
+#[cfg(not(windows))]
+fn running_as_root() -> bool {
+    matches!(
+        Command::new("id").arg("-u").output(),
+        Ok(output) if String::from_utf8_lossy(&output.stdout).trim() == "0"
+    )
+}
+
+#[cfg(windows)]
+fn running_as_root() -> bool {
+    false
 }
 
 fn count_entries(path: &Path) -> io::Result<u64> {
@@ -664,7 +1021,17 @@ fn interactive() -> Result<(), String> {
 
 fn print_help(program: &OsStr) {
     let exe = Path::new(program).display();
-    println!("ZCode Account Manager {}\n\nUsage / 用法:\n  {exe}\n  {exe} interactive\n  {exe} inspect\n  {exe} backup [--backup-dir DIR]\n  {exe} clean [--safe] [--no-backup] [--backup-dir DIR]\n  {exe} --check-update\n\nLanguage / 语言: set ZCODE_LANG=en or zh", env!("CARGO_PKG_VERSION"));
+    println!("ZCode Account Manager {}\n\nUsage / 用法:\n  {exe}\n  {exe} interactive\n  {exe} inspect\n  {exe} --whoami\n  {exe} backup [--backup-dir DIR]\n  {exe} clean [--safe] [--no-backup] [--backup-dir DIR]\n  {exe} send --pinned N --message \"...\" [--dry-run] [--at HH:MM] [--daily]  (Linux X11)\n  {exe} --check-update\n\nLanguage / 语言: set ZCODE_LANG=en or zh", env!("CARGO_PKG_VERSION"));
+}
+
+fn format_wait(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{}小时{}分", seconds / 3600, seconds % 3600 / 60)
+    } else if seconds >= 60 {
+        format!("{}分{}秒", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}秒")
+    }
 }
 
 fn run() -> Result<(), String> {
@@ -679,12 +1046,28 @@ fn run() -> Result<(), String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     match parse_args(args)? {
-        Action::Gui => gui::launch()?,
+        Action::Gui { start_hidden } => gui::launch(start_hidden)?,
         Action::InteractiveCli => interactive()?,
         Action::Help => print_help(&program),
         Action::Version => println!("zcode-account-manager {}", env!("CARGO_PKG_VERSION")),
         Action::CheckUpdate => check_update(),
         Action::Inspect => inspect(&Roots::detect()?).map_err(|e| e.to_string())?,
+        Action::Whoami => {
+            let roots = Roots::detect()?;
+            let identity = identity::detect(&roots);
+            println!("当前账号: {}", identity.describe());
+            println!(
+                "默认备份名: {}",
+                identity
+                    .default_name()
+                    .unwrap_or_else(|| "（未检测到登录状态）".into())
+            );
+            if zcode_running() {
+                println!("ZCode 桌面客户端: 运行中");
+            } else {
+                println!("ZCode 桌面客户端: 未运行");
+            }
+        }
         Action::Backup(dir) => {
             let roots = Roots::detect()?;
             let root =
@@ -692,11 +1075,82 @@ fn run() -> Result<(), String> {
             backup(&roots, &root).map_err(|e| e.to_string())?;
         }
         Action::Clean(options) => clean(&Roots::detect()?, options)?,
+        Action::AutoSend {
+            pinned,
+            message,
+            dry_run,
+            at,
+            daily,
+        } => {
+            // 定时模式：等待到目标时刻再执行（Ctrl+C 可中断）
+            if let Some(at_time) = &at {
+                let wait = auto_send::seconds_until(at_time, daily)?;
+                if daily {
+                    println!("[定时] 将在每天 {} 自动发送（首次 {} 后），Ctrl+C 取消。", at_time, format_wait(wait));
+                } else {
+                    println!("[定时] 将在 {} 后自动发送，Ctrl+C 取消。", format_wait(wait));
+                }
+                let mut remaining = wait;
+                while remaining > 0 {
+                    let tick = remaining.min(2);
+                    thread::sleep(Duration::from_secs(tick));
+                    remaining -= tick;
+                }
+                println!("[定时] 时间到，开始发送...");
+            }
+            let request = auto_send::AutoSendRequest {
+                pinned_index: pinned,
+                message,
+                steps: if dry_run {
+                    auto_send::SendSteps::locate_only()
+                } else {
+                    auto_send::SendSteps::full()
+                },
+            };
+            let mut progress = |line: &str| eprintln!("[自动发送] {line}");
+            auto_send::run(&request, &mut progress)?;
+        }
     }
     Ok(())
 }
 
+/// windows_subsystem="windows" 的进程不自带控制台；带命令行参数启动时附着父进程
+/// 控制台并重定向标准句柄，保证 inspect/backup/clean 等 CLI 子命令可见可用。
+/// 双击打开 GUI 时不调用，不会闪现控制台窗口。
+#[cfg(windows)]
+fn attach_parent_console() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
+    if env::args_os().len() <= 1 {
+        return;
+    }
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        // std 按需在首次使用时读取 STD_*_HANDLE；mem::forget 让句柄存活到进程结束
+        if let Ok(output) = fs::OpenOptions::new().write(true).open("CONOUT$") {
+            let handle = output.as_raw_handle();
+            std::mem::forget(output);
+            SetStdHandle(STD_OUTPUT_HANDLE, handle);
+            SetStdHandle(STD_ERROR_HANDLE, handle);
+        }
+        if let Ok(input) = fs::OpenOptions::new().read(true).open("CONIN$") {
+            let handle = input.as_raw_handle();
+            std::mem::forget(input);
+            SetStdHandle(STD_INPUT_HANDLE, handle);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() -> ExitCode {
+    attach_parent_console();
     let result = match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -712,7 +1166,14 @@ mod tests {
     use super::*;
     #[test]
     fn no_arguments_enters_gui_mode() {
-        assert!(matches!(parse_args(Vec::new()).unwrap(), Action::Gui));
+        assert!(matches!(
+            parse_args(Vec::new()).unwrap(),
+            Action::Gui { start_hidden: false }
+        ));
+        assert!(matches!(
+            parse_args(vec!["--hidden".to_string()]).unwrap(),
+            Action::Gui { start_hidden: true }
+        ));
     }
 
     #[test]

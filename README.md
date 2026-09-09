@@ -25,14 +25,16 @@
 
 双击 `zcode-account-manager.exe` 即进入 GUI，无需命令行：
 
-1. 登录一个 ZCode 账户并完全退出 ZCode。
-2. 输入容易识别的账户名称，点击 **保存当前账户**。
-3. 登录并保存其他账户，列表会集中展示所有账户快照。
-4. 以后退出 ZCode，在列表中点击 **切换**，再重新启动 ZCode 即可。
+1. 启动工具后自动识别**当前登录账号**：从本地配置提取用户名 / 用户 ID / 套餐来源，并生成凭据指纹，显示在“当前账号”栏。
+2. 点击 **保存当前账户** 即可，名称留空时自动使用账号标识命名（如 `bigmodel-user`）；想用更好记的名字就填一个**别名**。
+3. 登录并保存其他账户，列表会集中展示所有账户快照（名称、账号标识、保存时间）。
+4. 之后随时在列表中点击 **恢复**：如 ZCode 正在运行会先自动关闭，恢复完成后可勾选**自动启动 ZCode**，无需手动重启客户端。
 
-切换前，工具会自动更新当前账户快照并创建安全备份；目标账户恢复失败时会自动回滚。账户凭据不会显示在界面中，快照保存在 `%USERPROFILE%\.zcode\account_backups\`。
+恢复前，工具会自动更新当前账户快照并创建安全备份；目标账户恢复失败时会自动回滚。账户凭据不会显示在界面中，快照保存在 `%USERPROFILE%\.zcode\account_backups\`。每个账户可随时通过“别名”按钮重命名显示名称，别名只影响展示，不影响自动命名。
 
 > 账户快照包含登录凭据和 Cookie，请像保护密码一样保护备份目录，不要上传或分享。
+
+> 提示：恢复后自动启动 ZCode 依赖找到客户端程序（默认探测 `%LOCALAPPDATA%\Programs\ZCode\ZCode.exe` 等常见位置）。若安装位置特殊，可设置环境变量 `ZCODE_APP_PATH` 指向 ZCode 主程序。命令行 `zcode-account-manager.exe --whoami` 可快速查看当前识别到的账号标识。
 
 ![ZCode 账户管家 GUI](docs/zcode-account-manager.png)
 
@@ -62,10 +64,17 @@
 | **登录凭据** | `%USERPROFILE%\.zcode\v2\credentials.json` | 用户登录 Token 与授权身份 |
 | **套餐缓存** | `%USERPROFILE%\.zcode\v2\coding-plan-cache.json` | 缓存的 Plan 权益与领取状态 |
 | **遥测埋点** | `%USERPROFILE%\.zcode\v2\telemetry-state.json` | 本地客户端状态数据 |
+| **Provider 配置** | `%USERPROFILE%\.zcode\v2\config.json` | 模型 Provider 列表，内置套餐条目的 apiKey 为账号 OAuth JWT（账号身份来源之一） |
+| **应用设置** | `%USERPROFILE%\.zcode\v2\setting.json` | 客户端设置，含 Provider 家族/套餐选择状态 |
+| **CLI 配置** | `%USERPROFILE%\.zcode\cli\config.json` | CLI 侧 Provider 配置（含账号 apiKey） |
 | **网页会话** | `%APPDATA%\ZCode\session\Cookies` | Electron 登录态 Cookie |
 | **页面存储** | `%APPDATA%\ZCode\session\Local Storage\` | 前端页面持久化数据 |
 | **设备特征** | `%APPDATA%\ZCode\rum-electron-store\` | 客户端设备监控与特征信息 |
 | **升级标记** | `%APPDATA%\ZCode\.updaterId` | 客户端更新器标识 |
+
+> `%APPDATA%` 在非 Windows 平台的对应目录：Linux 为 `~/.config`（ZCode 桌面端位于 `~/.config/ZCode`），macOS 为 `~/Library/Application Support`。
+>
+> 0.6.0 之前的账户快照不包含 Provider 配置、应用设置和 CLI 配置三项；用旧快照切换账户时会保留这三项的本机现状，不做清空。
 
 ---
 
@@ -73,7 +82,29 @@
 
 发布文件 `zcode-account-manager.exe` 不需要 Python 或其他运行时。
 
-直接双击 EXE 会打开 **ZCode 账户管家**。账户页用于备份、更新、切换和删除账户快照；清理页提供安全清理和完整重置。所有会改动本地状态的操作都有明确状态反馈和二次确认。
+直接双击 EXE 会打开 **ZCode 账户管家**。账户页用于备份、更新、切换和删除账户快照；清理页提供安全清理和完整重置；「自动发送」页可以向 ZCode 桌面端的指定会话自动发送消息。所有会改动本地状态的操作都有明确状态反馈和二次确认。
+
+## 自动发送消息（Linux X11）
+
+「自动发送」页可以把一条消息自动发进 ZCode 桌面端侧栏「已置顶」区的第 N 个会话，适合定时任务、批量通知等场景。执行流程（约 5 秒，期间请勿操作鼠标键盘）：
+
+1. 按窗口类 `ZCode` 定位并激活 ZCode 主窗口；
+2. 把会话列表滚动到最顶部，露出「已置顶」区块；
+3. 点击「已置顶」区从上往下第 N 个会话，并点击输入框使其获得焦点；
+4. 将消息写入剪贴板粘贴进输入框（绕开输入法预编辑，避免回车先确认候选词），回车发送。
+
+**定位测试自定义**：始终包含「激活窗口 + 滚动到顶部 + 悬停目标行」，测试项目可通过多选框自由组合——「点击切换」「粘贴输入」「回车发送」，全部不勾选即为纯定位悬停，方便逐段核对与排障。
+
+**定时发送**：勾选「定时发送」并填入 HH:MM 时间（可选「每天重复」），确认后到点自动执行完整发送；界面会显示已预约的任务，可随时「取消定时」。定时任务在程序退出后失效。命令行同样支持：
+
+```bash
+zcode-account-manager send --pinned 1 --message "日常巡检开始"
+zcode-account-manager send --pinned 2 --message "..." --dry-run          # 只定位悬停，不点击不发送
+zcode-account-manager send --pinned 1 --message "早报" --at 09:30        # 今天 09:30 发送
+zcode-account-manager send --pinned 1 --message "早报" --at 09:30 --daily # 每天 09:30 发送
+```
+
+发送前后会自动保存并恢复剪贴板内容。点击坐标基于默认字号/缩放实测校准，若系统缩放不同导致点击偏移，需要调整 `src/auto_send.rs` 中的坐标常量。
 
 ## 多语言与自动更新
 
@@ -122,6 +153,15 @@ cargo build --release
 ```
 
 生成文件位于 `target\release\zcode-account-manager.exe`。仓库中的 GitHub Actions 也会在推送 `v*` 标签时构建 Windows x86_64 EXE。
+
+### 7. 平台支持
+
+| 平台 | 状态 | 说明 |
+| :--- | :--- | :--- |
+| Windows x86_64 | ✅ 主要目标 | GUI、系统托盘（Shell_NotifyIcon）、CLI 子命令均可使用 |
+| Linux X11 | ✅ 可用 | 同一 GUI；托盘走 XEmbed 协议，CLI 子命令均可使用 |
+
+两个平台共用同一套代码：平台差异（托盘、打开目录、进程管理、字体）都通过 `#[cfg]` 分支处理。CLI 子命令在 Windows 上从终端启动时会自动附着到父控制台，输出与交互和 Linux 一致；双击打开 GUI 则不会闪现控制台窗口。
 
 ---
 

@@ -20,3 +20,13 @@ target/
 .idea/
 .vscode/
 .webclx-paste/
+
+# Temp / release staging (never commit)
+.tmp/
+.tmp-*.json
+
+# Local agent instructions (contains tokens)
+AGENTS.md
+
+# target symlink (cargo target dir is redirected)
+/target
