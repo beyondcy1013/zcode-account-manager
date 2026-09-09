@@ -40,15 +40,17 @@
 
 ---
 
-## Gemini 账号管理
+## CLI 账号管理（Gemini / Codex / Claude Code）
 
-「Gemini 账号」页为 **Google Gemini CLI** 及其继任者 **Antigravity CLI（`agy`）** 提供多账号体验：Gemini CLI 已并入 Antigravity CLI，两者共用 `~/.gemini` 目录，本工具对两者同时支持——备份当前登录状态，在多个 Google 账号之间一键切换。
+「CLI 账号」页为三个主流 AI 编程 CLI 提供统一的多账号体验：**Google Gemini CLI / Antigravity CLI（`agy`）**、**OpenAI Codex CLI** 和 **Anthropic Claude Code**。每个工具一个标签页，操作方式完全一致：
 
-1. 用 Gemini CLI 或 `agy` 登录一个 Google 账号后，打开「Gemini 账号」页，工具会自动识别当前账号（邮箱、认证方式、凭据指纹）并显示在「当前 Gemini 账号」栏。
-2. 点击 **保存当前账号** 创建备份；名称留空时自动用邮箱前缀命名（如 `someone`），也可填一个好记的**别名**。
+1. 用 CLI 登录一个账号后，在对应标签页工具会自动识别当前账号（邮箱 / 认证方式 / 凭据指纹）并显示在「当前账号」栏。
+2. 点击 **保存当前账号** 创建备份；名称留空时自动用邮箱前缀或指纹前缀命名，也可填一个好记的**别名**。
 3. 登录其他账号并分别保存，之后随时在列表中点击 **切换**：切换前当前状态会自动备份到原账号，目标恢复失败时自动回滚。
 
-备份保存在 `~/.gemini/account_backups/`（Windows 为 `%USERPROFILE%\.gemini\account_backups\`），快照内容：
+各工具的快照内容与备份位置（备份统一放在各自目录下的 `account_backups/`）：
+
+**Gemini / Antigravity CLI**（`~/.gemini/account_backups/`；Gemini CLI 已并入 Antigravity CLI，两者共用 `~/.gemini`，同时支持）：
 
 | 快照项 | 路径（`~/.gemini/` 下） | 说明 |
 | :--- | :--- | :--- |
@@ -62,9 +64,25 @@
 
 > 邮箱识别：旧版 Gemini CLI 从 `google_accounts.json` / id_token 读取；`agy` 的 token 文件不含邮箱，改为从其认证日志（`antigravity-cli/log/` 中的 `applyAuthResult: email=...`）尽力提取，日志被清理时仅影响显示名称，不影响凭据指纹与账号匹配。
 
-> ⚠️ 切换前请退出正在运行的 `gemini` / `agy` 会话：运行中的会话可能在切换后把旧登录凭据回写覆盖。工具检测到相关 CLI 运行时会在界面上给出提示；切换完成后重启会话即可使用新账号。
+**Codex CLI**（`~/.codex/account_backups/`）：
 
-> 账户快照包含 OAuth 登录凭据，请像保护密码一样保护备份目录，不要上传或分享。
+| 快照项 | 路径（`~/.codex/` 下） | 说明 |
+| :--- | :--- | :--- |
+| **认证凭据** | `auth.json` | ChatGPT OAuth 登录（`tokens.*`，邮箱取自 id_token，指纹按 `refresh_token` 计算）或 API Key 模式（按 Key 摘要区分账号） |
+| **用户配置** | `config.toml` | 模型、Provider 等用户配置；快照缺失时保留本机现状，不随账号切换 |
+
+**Claude Code**（`~/.claude/account_backups/`）：
+
+| 快照项 | 路径（`~/.claude/` 下） | 说明 |
+| :--- | :--- | :--- |
+| **OAuth 凭据** | `.credentials.json` | claude.ai OAuth 登录（存在时纳入快照；邮箱取自 accessToken，指纹按 `refreshToken` 计算） |
+| **设置** | `settings.json` | 用户设置，含 `env` 中的 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` 自定义端点认证——替换该文件即可在中转 / 第三方端点账号之间切换；快照缺失时保留本机现状 |
+
+> 端点账号识别：Claude Code 通过 settings 中的 Token + `ANTHROPIC_BASE_URL` 识别（如 `API 端点 open.bigmodel.cn`），Token 或端点不同即视为不同账号。
+
+> ⚠️ 切换前请退出对应 CLI 正在运行的会话：运行中的会话可能在切换后把旧登录凭据回写覆盖。工具检测到相关 CLI 运行时会在界面上给出提示；切换完成后重启会话即可使用新账号。
+
+> 账户快照包含 OAuth 登录凭据与 API Token，请像保护密码一样保护备份目录，不要上传或分享。
 
 ---
 
@@ -110,7 +128,7 @@
 
 发布文件 `zcode-account-manager.exe` 不需要 Python 或其他运行时。
 
-直接双击 EXE 会打开 **ZCode 账户管家**。账户页用于备份、更新、切换和删除 ZCode 账户快照；「Gemini 账号」页为 Gemini CLI 提供同样的多账号备份与切换；清理页提供安全清理和完整重置；「自动发送」页可以向 ZCode 桌面端的指定会话自动发送消息。所有会改动本地状态的操作都有明确状态反馈和二次确认。
+直接双击 EXE 会打开 **ZCode 账户管家**。账户页用于备份、更新、切换和删除 ZCode 账户快照；「CLI 账号」页为 Gemini / Antigravity、Codex、Claude Code 三个 CLI 提供同样的多账号备份与切换；清理页提供安全清理和完整重置；「自动发送」页可以向 ZCode 桌面端的指定会话自动发送消息。所有会改动本地状态的操作都有明确状态反馈和二次确认。
 
 ## 自动发送消息（Linux X11）
 

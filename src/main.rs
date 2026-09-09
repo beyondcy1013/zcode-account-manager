@@ -18,6 +18,9 @@ use std::{
 
 mod accounts;
 mod auto_send;
+mod claude;
+mod cli_accounts;
+mod codex;
 mod gemini;
 mod gui;
 mod identity;
@@ -1063,8 +1066,9 @@ fn run() -> Result<(), String> {
                     .default_name()
                     .unwrap_or_else(|| "（未检测到登录状态）".into())
             );
-            let gemini_identity = gemini::detect(&roots);
-            println!("Gemini 账号: {}", gemini_identity.describe());
+            for store in [&gemini::STORE, &codex::STORE, &claude::STORE] {
+                println!("{} 账号: {}", store.display, store.identity(&roots).describe());
+            }
             if zcode_running() {
                 println!("ZCode 桌面客户端: 运行中");
             } else {

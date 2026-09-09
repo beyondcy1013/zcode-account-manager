@@ -4,8 +4,8 @@ use crate::{
         set_alias, set_phone, switch_account, AccountProfile,
     },
     auto_send::{self, AutoSendRequest, SendSteps},
-    clean, gemini, launch_zcode, single_instance, terminate_zcode, tray, zcode_running,
-    CleanOptions, Roots,
+    clean, claude, cli_accounts, codex, gemini, launch_zcode, single_instance, terminate_zcode,
+    tray, zcode_running, CleanOptions, Roots,
 };
 use eframe::egui::{self, Color32, RichText};
 use std::{
@@ -23,18 +23,23 @@ use crate::identity::{self, AccountIdentity};
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Accounts,
-    Gemini,
+    ToolAccounts,
     Cleanup,
     AutoSend,
 }
+
+/// CLI 工具账号页展示的工具顺序。
+const TOOL_STORES: [&'static cli_accounts::ToolStore; 3] =
+    [&gemini::STORE, &codex::STORE, &claude::STORE];
 
 enum ConfirmAction {
     Switch(String),
     Save { name: Option<String> },
     Update(String),
     Delete(String),
-    GeminiSwitch(String),
-    GeminiDelete(String),
+    /// 按 TOOL_STORES 下标定位工具。
+    ToolSwitch(usize, String),
+    ToolDelete(usize, String),
     Clean(bool),
     AutoSend {
         request: AutoSendRequest,
@@ -50,10 +55,61 @@ struct AccountEditor {
     phone: String,
 }
 
-/// Gemini 账号编辑窗口的状态：仅别名。
-struct GeminiEditor {
+/// CLI 工具账号编辑窗口的状态：仅别名。
+struct ToolEditor {
     id: String,
     alias: String,
+}
+
+/// 一个 CLI 工具在界面中的账号状态：列表、当前标识与编辑窗口。
+struct ToolAccounts {
+    store: &'static cli_accounts::ToolStore,
+    accounts: Vec<AccountProfile>,
+    active_id: Option<String>,
+    identity: cli_accounts::CliIdentity,
+    account_name: String,
+    editor: Option<ToolEditor>,
+    /// 是否检测到正在运行的 CLI 会话（刷新时更新，不逐帧探测）。
+    cli_running: bool,
+}
+
+impl ToolAccounts {
+    fn new(store: &'static cli_accounts::ToolStore) -> Self {
+        Self {
+            store,
+            accounts: Vec::new(),
+            active_id: None,
+            identity: cli_accounts::CliIdentity::default(),
+            account_name: String::new(),
+            editor: None,
+            cli_running: false,
+        }
+    }
+
+    fn profile(&self, id: &str) -> Option<AccountProfile> {
+        self.accounts
+            .iter()
+            .find(|profile| profile.manifest.id == id)
+            .cloned()
+    }
+
+    /// 当前登录状态对应的既有备份（按凭据指纹匹配）。
+    fn matched_profile(&self) -> Option<&AccountProfile> {
+        let fingerprint = self.identity.fingerprint.as_deref()?;
+        self.accounts
+            .iter()
+            .find(|profile| profile.manifest.fingerprint.as_deref() == Some(fingerprint))
+    }
+
+    /// 备份名：用户输入优先，否则回落到当前账号标识推导的默认名。
+    fn pending_save_name(&self) -> Option<String> {
+        let trimmed = self.account_name.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
 }
 
 /// 自动发送后台任务的状态：工作线程写入，UI 每帧读取展示。
@@ -90,14 +146,10 @@ pub struct ZCodeApp {
     schedule_time: String,
     schedule_daily: bool,
     schedule_cancel: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>>,
-    /// Gemini 账号状态：备份列表、当前标识与编辑窗口。
-    gemini_accounts: Vec<AccountProfile>,
-    gemini_active_id: Option<String>,
-    gemini_identity: gemini::GeminiIdentity,
-    gemini_account_name: String,
-    gemini_editor: Option<GeminiEditor>,
-    /// 是否检测到正在运行的 Gemini CLI 会话（刷新时更新，不逐帧探测）。
-    gemini_cli_running: bool,
+    /// CLI 工具（Gemini / Codex / Claude）账号状态，与 TOOL_STORES 顺序一致。
+    tools: Vec<ToolAccounts>,
+    /// CLI 账号页当前选中的工具下标。
+    tool_page: usize,
 }
 
 impl ZCodeApp {
@@ -142,12 +194,11 @@ impl ZCodeApp {
             schedule_time: "09:00".into(),
             schedule_daily: true,
             schedule_cancel: Arc::new(Mutex::new(None)),
-            gemini_accounts: Vec::new(),
-            gemini_active_id: None,
-            gemini_identity: gemini::GeminiIdentity::default(),
-            gemini_account_name: String::new(),
-            gemini_editor: None,
-            gemini_cli_running: false,
+            tools: TOOL_STORES
+                .iter()
+                .map(|store| ToolAccounts::new(store))
+                .collect(),
+            tool_page: 0,
         };
         app.refresh();
         if app.account_name.is_empty() {
@@ -155,9 +206,11 @@ impl ZCodeApp {
                 app.account_name = default_name;
             }
         }
-        if app.gemini_account_name.is_empty() {
-            if let Some(default_name) = app.gemini_identity.default_name() {
-                app.gemini_account_name = default_name;
+        for tool in app.tools.iter_mut() {
+            if tool.account_name.is_empty() {
+                if let Some(default_name) = tool.identity.default_name(tool.store.id_prefix) {
+                    tool.account_name = default_name;
+                }
             }
         }
         app
@@ -171,21 +224,27 @@ impl ZCodeApp {
             }
             Err(error) => self.set_error(error),
         }
-        match gemini::list_accounts(&self.roots) {
-            Ok(accounts) => {
-                self.gemini_accounts = accounts;
-                self.gemini_active_id = gemini::active_account(&self.roots);
+        let mut errors = Vec::new();
+        for tool in self.tools.iter_mut() {
+            let store = tool.store;
+            match store.list_accounts(&self.roots) {
+                Ok(accounts) => {
+                    tool.accounts = accounts;
+                    tool.active_id = store.active_account(&self.roots);
+                }
+                Err(error) => errors.push(error),
             }
-            Err(error) => self.set_error(error),
+            // 工具账号识别只读本地文件，代价低，随列表一起刷新
+            tool.identity = (store.detect)(&self.roots);
+            tool.cli_running = store.cli_running();
         }
-        // Gemini 识别只读本地文件，代价低，随列表一起刷新
-        self.gemini_identity = gemini::detect(&self.roots);
-        self.gemini_cli_running = gemini::cli_running();
+        for error in errors {
+            self.set_error(error);
+        }
     }
 
     fn reload_identity(&mut self) {
         self.current_identity = identity::detect(&self.roots);
-        self.gemini_identity = gemini::detect(&self.roots);
     }
 
     /// 当前登录状态对应的既有备份（按凭据指纹匹配）。
@@ -283,42 +342,22 @@ impl ZCodeApp {
         self.status.push_str(extra);
     }
 
-    fn gemini_profile(&self, id: &str) -> Option<AccountProfile> {
-        self.gemini_accounts
-            .iter()
-            .find(|profile| profile.manifest.id == id)
-            .cloned()
-    }
-
-    /// 当前 Gemini 登录状态对应的既有备份（按 refresh_token 指纹匹配）。
-    fn gemini_matched_profile(&self) -> Option<&AccountProfile> {
-        let fingerprint = self.gemini_identity.fingerprint.as_deref()?;
-        self.gemini_accounts
-            .iter()
-            .find(|profile| profile.manifest.fingerprint.as_deref() == Some(fingerprint))
-    }
-
-    /// Gemini 备份名：用户输入优先，否则回落到当前账号标识推导的默认名。
-    fn gemini_pending_save_name(&self) -> Option<String> {
-        let trimmed = self.gemini_account_name.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    }
-
-    /// 保存当前 Gemini 登录状态为新备份。只读取本地文件，无需关闭任何程序。
-    fn do_gemini_save(&mut self, name: Option<String>) -> bool {
-        match gemini::save_current_account(&self.roots, name.as_deref(), None) {
+    /// 保存某 CLI 工具的当前登录状态为新备份。只读取本地文件，无需关闭任何程序。
+    fn do_tool_save(&mut self, tool_index: usize, name: Option<String>) -> bool {
+        let Some(store) = self.tools.get(tool_index).map(|tool| tool.store) else {
+            return false;
+        };
+        match store.save_current_account(&self.roots, name.as_deref(), None) {
             Ok(profile) => {
-                self.gemini_account_name.clear();
+                self.tools[tool_index].account_name.clear();
                 self.refresh();
-                if let Some(default_name) = self.gemini_identity.default_name() {
-                    self.gemini_account_name = default_name;
+                let tool = &self.tools[tool_index];
+                if let Some(default_name) = tool.identity.default_name(store.id_prefix) {
+                    self.tools[tool_index].account_name = default_name;
                 }
                 self.set_ok(format!(
-                    "已备份 Gemini 账号：{}",
+                    "已备份 {} 账号：{}",
+                    store.display,
                     profile.manifest.display_name()
                 ));
                 true
@@ -330,18 +369,22 @@ impl ZCodeApp {
         }
     }
 
-    fn do_gemini_update(&mut self, id: &str) -> bool {
-        let Some(profile) = self.gemini_profile(id) else {
+    fn do_tool_update(&mut self, tool_index: usize, id: &str) -> bool {
+        let Some(store) = self.tools.get(tool_index).map(|tool| tool.store) else {
             return false;
         };
-        match gemini::save_current_account(
+        let Some(profile) = self.tools[tool_index].profile(id) else {
+            return false;
+        };
+        match store.save_current_account(
             &self.roots,
             Some(&profile.manifest.name),
             Some(&profile),
         ) {
             Ok(_) => {
                 self.set_ok(format!(
-                    "已更新 Gemini 账号备份：{}",
+                    "已更新 {} 账号备份：{}",
+                    store.display,
                     profile.manifest.display_name()
                 ));
                 self.refresh();
@@ -421,30 +464,38 @@ impl ZCodeApp {
                     Err(error) => self.set_error(error),
                 }
             }
-            ConfirmAction::GeminiSwitch(id) => {
-                let Some(profile) = self.gemini_profile(&id) else {
-                    self.set_error("目标 Gemini 账号不存在");
+            ConfirmAction::ToolSwitch(tool_index, id) => {
+                let Some(store) = self.tools.get(tool_index).map(|tool| tool.store) else {
                     return;
                 };
-                match gemini::switch_account(&self.roots, &profile) {
+                let Some(profile) = self.tools[tool_index].profile(&id) else {
+                    self.set_error("目标账号不存在");
+                    return;
+                };
+                match store.switch_account(&self.roots, &profile) {
                     Ok(()) => {
                         self.refresh();
                         self.set_ok(format!(
-                            "已切换到 Gemini 账号 {}；正在运行的 gemini 会话请重启后使用",
+                            "已切换到 {} 账号 {}；正在运行的会话请重启后使用",
+                            store.display,
                             profile.manifest.display_name()
                         ));
                     }
                     Err(error) => self.set_error(error),
                 }
             }
-            ConfirmAction::GeminiDelete(id) => {
-                let Some(profile) = self.gemini_profile(&id) else {
+            ConfirmAction::ToolDelete(tool_index, id) => {
+                let Some(store) = self.tools.get(tool_index).map(|tool| tool.store) else {
                     return;
                 };
-                match gemini::delete_account(&self.roots, &profile) {
+                let Some(profile) = self.tools[tool_index].profile(&id) else {
+                    return;
+                };
+                match store.delete_account(&self.roots, &profile) {
                     Ok(()) => {
                         self.set_ok(format!(
-                            "已删除 Gemini 备份：{}",
+                            "已删除 {} 备份：{}",
+                            store.display,
                             profile.manifest.display_name()
                         ));
                         self.refresh();
@@ -788,31 +839,55 @@ impl ZCodeApp {
         });
     }
 
-    fn gemini_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Gemini 账号备份与切换");
-        ui.label(
-            "管理 Google Gemini CLI / Antigravity CLI（agy，Gemini CLI 的继任者，两者共用 ~/.gemini）的登录账号：备份当前账号，在多个 Google 账号间一键切换。切换会整体替换 OAuth 凭据与账号缓存。",
-        );
+    fn tool_accounts_page(&mut self, ui: &mut egui::Ui) {
+        // 工具选择器
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("工具").strong());
+            for (index, store) in TOOL_STORES.iter().enumerate() {
+                if ui
+                    .selectable_label(self.tool_page == index, store.tab)
+                    .on_hover_text(store.display)
+                    .clicked()
+                {
+                    self.tool_page = index;
+                }
+            }
+        });
+        ui.add_space(6.0);
+
+        let tool_index = self.tool_page;
+        let store = self.tools[tool_index].store;
+        ui.heading(format!("{} 账号备份与切换", store.tab));
+        ui.label(format!(
+            "管理 {} 的登录账号：备份当前账号，在多个账号间一键切换。切换会整体替换登录凭据与账号缓存。",
+            store.display
+        ));
         ui.add_space(8.0);
-        if self.gemini_cli_running {
+        if self.tools[tool_index].cli_running {
             ui.colored_label(
                 Color32::from_rgb(190, 112, 28),
-                "检测到 Gemini CLI / agy 正在运行：切换或更新备份前请先退出相关会话，否则旧会话可能把登录凭据回写覆盖。",
+                format!(
+                    "检测到 {} 正在运行：切换或更新备份前请先退出相关会话，否则旧会话可能把登录凭据回写覆盖。",
+                    store.cli_names
+                ),
             );
         }
-        self.gemini_identity_banner(ui);
+        self.tool_identity_banner(tool_index, ui);
         ui.add_space(8.0);
 
-        let default_name = self.gemini_identity.default_name();
-        let can_save = self.gemini_pending_save_name().is_some() || default_name.is_some();
+        let default_name = self.tools[tool_index].identity.default_name(store.id_prefix);
+        let can_save =
+            self.tools[tool_index].pending_save_name().is_some() || default_name.is_some();
         ui.horizontal(|ui| {
             ui.label("账户名称");
             let input = ui.add_sized(
                 [260.0, 30.0],
-                egui::TextEdit::singleline(&mut self.gemini_account_name).hint_text(match &default_name {
-                    Some(name) => format!("默认：{name}"),
-                    None => "例如：主力 Gmail".into(),
-                }),
+                egui::TextEdit::singleline(&mut self.tools[tool_index].account_name).hint_text(
+                    match &default_name {
+                        Some(name) => format!("默认：{name}"),
+                        None => format!("例如：我的{}账号", store.tab),
+                    },
+                ),
             );
             let save = ui.add_enabled(can_save, egui::Button::new("保存当前账号"));
             if save.clicked()
@@ -820,39 +895,43 @@ impl ZCodeApp {
                     && ui.input(|input| input.key_pressed(egui::Key::Enter))
                     && can_save)
             {
-                let name = self.gemini_pending_save_name();
-                self.do_gemini_save(name);
+                let name = self.tools[tool_index].pending_save_name();
+                self.do_tool_save(tool_index, name);
             }
             if ui.button("刷新").clicked() {
                 self.refresh();
-                self.set_ok("已刷新 Gemini 账号列表与当前账号");
+                self.set_ok("已刷新 CLI 账号列表与当前账号");
             }
             if ui.button("打开备份目录").clicked() {
-                match gemini::open_accounts_folder(&self.roots) {
-                    Ok(()) => self.set_ok("已打开 Gemini 备份目录"),
+                match store.open_accounts_folder(&self.roots) {
+                    Ok(()) => self.set_ok(format!("已打开 {} 备份目录", store.display)),
                     Err(error) => self.set_error(error),
                 }
             }
         });
         ui.add_space(14.0);
 
-        if self.gemini_accounts.is_empty() {
+        if self.tools[tool_index].accounts.is_empty() {
             ui.group(|ui| {
                 ui.set_min_height(110.0);
                 ui.vertical_centered(|ui| {
                     ui.add_space(18.0);
-                    ui.label(RichText::new("还没有 Gemini 账号备份").strong());
-                    ui.label("先用 Gemini CLI 或 Antigravity CLI（agy）登录一个 Google 账号，再点击上方「保存当前账号」创建备份。");
+                    ui.label(RichText::new(format!("还没有 {} 账号备份", store.tab)).strong());
+                    ui.label(format!(
+                        "先用 {} 登录一个账号，再点击上方「保存当前账号」创建备份。",
+                        store.display
+                    ));
                     ui.label("创建后列表每一行都会出现「切换」按钮，随时一键换号。");
                 });
             });
             return;
         }
 
+        let rows = self.tools[tool_index].accounts.clone();
         egui::ScrollArea::both().show(ui, |ui| {
             // 邮箱等账号标识可能很长：限制文本列宽度并保持单行截断，避免把「操作」按钮挤出可视区
             let identity_max_width = (ui.available_width() * 0.22).max(140.0);
-            egui::Grid::new("gemini_accounts_table")
+            egui::Grid::new("tool_accounts_table")
                 .striped(true)
                 .min_col_width(40.0)
                 .spacing([10.0, 8.0])
@@ -865,10 +944,10 @@ impl ZCodeApp {
                     ui.strong("操作");
                     ui.end_row();
 
-                    let rows = self.gemini_accounts.clone();
                     for profile in rows {
                         let id = profile.manifest.id.clone();
-                        let is_active = self.gemini_active_id.as_deref() == Some(id.as_str());
+                        let is_active =
+                            self.tools[tool_index].active_id.as_deref() == Some(id.as_str());
                         if is_active {
                             ui.colored_label(Color32::from_rgb(32, 132, 88), "当前");
                         } else {
@@ -903,18 +982,19 @@ impl ZCodeApp {
                                     egui::Button::new(RichText::new("切换").strong()),
                                 )
                                 .on_hover_text(
-                                    "切换到此 Gemini 账号；当前状态会先自动备份，恢复失败会自动回滚",
+                                    "切换到此账号；当前状态会先自动备份到该账号，恢复失败会自动回滚",
                                 )
                                 .clicked()
                             {
-                                self.confirm = Some(ConfirmAction::GeminiSwitch(id.clone()));
+                                self.confirm =
+                                    Some(ConfirmAction::ToolSwitch(tool_index, id.clone()));
                             }
                             if ui
                                 .button("编辑")
                                 .on_hover_text("设置别名，便于识别账号")
                                 .clicked()
                             {
-                                self.gemini_editor = Some(GeminiEditor {
+                                self.tools[tool_index].editor = Some(ToolEditor {
                                     id: id.clone(),
                                     alias: profile.manifest.alias.clone().unwrap_or_default(),
                                 });
@@ -926,13 +1006,13 @@ impl ZCodeApp {
                                 )
                                 .clicked()
                             {
-                                self.do_gemini_update(&id);
+                                self.do_tool_update(tool_index, &id);
                             }
                             if ui
                                 .button(RichText::new("删除").color(Color32::from_rgb(180, 48, 48)))
                                 .clicked()
                             {
-                                self.confirm = Some(ConfirmAction::GeminiDelete(id));
+                                self.confirm = Some(ConfirmAction::ToolDelete(tool_index, id));
                             }
                         });
                         ui.end_row();
@@ -941,21 +1021,22 @@ impl ZCodeApp {
         });
     }
 
-    fn gemini_identity_banner(&mut self, ui: &mut egui::Ui) {
+    fn tool_identity_banner(&mut self, tool_index: usize, ui: &mut egui::Ui) {
+        let tool = &self.tools[tool_index];
         ui.group(|ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new("当前 Gemini 账号").strong());
-                let has_state = self.gemini_identity.is_present();
+                ui.label(RichText::new(format!("当前 {} 账号", tool.store.tab)).strong());
+                let has_state = tool.identity.is_present();
                 ui.colored_label(
                     if has_state {
                         Color32::from_rgb(32, 132, 88)
                     } else {
                         Color32::from_rgb(190, 112, 28)
                     },
-                    self.gemini_identity.describe(),
+                    tool.identity.describe(),
                 );
-                if let Some(matched) = self.gemini_matched_profile() {
+                if let Some(matched) = tool.matched_profile() {
                     ui.label(format!(
                         "（与备份「{}」一致）",
                         matched.manifest.display_name()
@@ -1062,30 +1143,41 @@ impl ZCodeApp {
                     "确认删除",
                 )
             }
-            ConfirmAction::GeminiSwitch(id) => {
-                let name = self
-                    .gemini_profile(id)
+            ConfirmAction::ToolSwitch(tool_index, id) => {
+                let tool = &self.tools[*tool_index];
+                let name = tool
+                    .profile(id)
                     .map(|profile| profile.manifest.display_name().to_string())
                     .unwrap_or_default();
-                let running_hint = if self.gemini_cli_running {
-                    "检测到 Gemini CLI / agy 正在运行，切换后请重启相关会话，避免旧会话回写登录凭据。"
+                let running_hint = if tool.cli_running {
+                    format!(
+                        "检测到 {} 正在运行，切换后请重启相关会话，避免旧会话回写登录凭据。",
+                        tool.store.cli_names
+                    )
                 } else {
-                    ""
+                    String::new()
                 };
                 (
-                    "确认切换 Gemini 账号",
-                    format!("将把 Gemini / Antigravity CLI 本地登录状态切换为「{name}」。当前状态会先自动备份到该账号。{running_hint}"),
+                    "确认切换 CLI 账号",
+                    format!(
+                        "将把 {} 本地登录状态切换为「{name}」。当前状态会先自动备份到该账号。{running_hint}",
+                        tool.store.display
+                    ),
                     "开始切换",
                 )
             }
-            ConfirmAction::GeminiDelete(id) => {
-                let name = self
-                    .gemini_profile(id)
+            ConfirmAction::ToolDelete(tool_index, id) => {
+                let tool = &self.tools[*tool_index];
+                let name = tool
+                    .profile(id)
                     .map(|profile| profile.manifest.display_name().to_string())
                     .unwrap_or_default();
                 (
-                    "删除 Gemini 账号备份",
-                    format!("确定删除“{name}”的 Gemini 本地备份？此操作不会删除 Google 云端账号。"),
+                    "删除 CLI 账号备份",
+                    format!(
+                        "确定删除“{name}”的 {} 本地备份？此操作不会删除云端账号。",
+                        tool.store.display
+                    ),
                     "确认删除",
                 )
             }
@@ -1246,17 +1338,19 @@ impl ZCodeApp {
         }
     }
 
-    fn gemini_editor_window(&mut self, ctx: &egui::Context) {
-        let Some(mut editor) = self.gemini_editor.take() else {
+    fn tool_editor_window(&mut self, ctx: &egui::Context) {
+        let tool_index = self.tool_page;
+        let Some(mut editor) = self.tools[tool_index].editor.take() else {
             return;
         };
-        let default_name = self
-            .gemini_profile(&editor.id)
+        let store = self.tools[tool_index].store;
+        let default_name = self.tools[tool_index]
+            .profile(&editor.id)
             .map(|profile| profile.manifest.name.clone())
             .unwrap_or_default();
         let mut confirmed = false;
         let mut cancelled = false;
-        egui::Window::new("编辑 Gemini 账号信息")
+        egui::Window::new(format!("编辑 {} 账号信息", store.tab))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -1269,7 +1363,7 @@ impl ZCodeApp {
                     let input = ui.add_sized(
                         [270.0, 28.0],
                         egui::TextEdit::singleline(&mut editor.alias)
-                            .hint_text("例如：主力 Gmail（留空表示清除别名）"),
+                            .hint_text("例如：工作主号（留空表示清除别名）"),
                     );
                     confirmed = confirmed
                         || (input.lost_focus()
@@ -1286,18 +1380,18 @@ impl ZCodeApp {
                 });
             });
         if confirmed {
-            self.save_gemini_editor(editor);
+            self.save_tool_editor(tool_index, editor);
         } else if cancelled {
             // 丢弃编辑状态
         } else {
-            self.gemini_editor = Some(editor);
+            self.tools[tool_index].editor = Some(editor);
         }
     }
 
-    /// 保存 Gemini 编辑窗口中的别名；留空即清除。
-    fn save_gemini_editor(&mut self, editor: GeminiEditor) {
+    /// 保存编辑窗口中的别名；留空即清除。
+    fn save_tool_editor(&mut self, tool_index: usize, editor: ToolEditor) {
         let alias = editor.alias.trim();
-        let Some(profile) = self.gemini_profile(&editor.id) else {
+        let Some(profile) = self.tools[tool_index].profile(&editor.id) else {
             return;
         };
         if alias == profile.manifest.alias.as_deref().unwrap_or_default() {
@@ -1522,10 +1616,11 @@ impl eframe::App for ZCodeApp {
                     self.page = Page::Accounts;
                 }
                 if ui
-                    .selectable_label(self.page == Page::Gemini, "Gemini 账号")
+                    .selectable_label(self.page == Page::ToolAccounts, "CLI 账号")
+                    .on_hover_text("Gemini / Codex / Claude Code 账号备份与切换")
                     .clicked()
                 {
-                    self.page = Page::Gemini;
+                    self.page = Page::ToolAccounts;
                 }
                 if ui
                     .selectable_label(self.page == Page::Cleanup, "清理")
@@ -1570,7 +1665,7 @@ impl eframe::App for ZCodeApp {
             ui.add_space(10.0);
             match self.page {
                 Page::Accounts => self.accounts_page(ui),
-                Page::Gemini => self.gemini_page(ui),
+                Page::ToolAccounts => self.tool_accounts_page(ui),
                 Page::Cleanup => self.cleanup_page(ui),
                 Page::AutoSend => self.auto_send_page(ui),
             }
@@ -1590,7 +1685,7 @@ impl eframe::App for ZCodeApp {
         });
         self.confirmation_window(&ctx);
         self.account_editor_window(&ctx);
-        self.gemini_editor_window(&ctx);
+        self.tool_editor_window(&ctx);
     }
 }
 
