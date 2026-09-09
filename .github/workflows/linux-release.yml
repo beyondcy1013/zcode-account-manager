@@ -1,0 +1,37 @@
+name: linux-release
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Write update manifest
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          asset="zcode-account-manager-$version"
+          cp target/release/zcode-account-manager "$asset"
+          sha256=$(sha256sum "$asset" | awk '{print $1}')
+          url="https://github.com/${{ github.repository }}/releases/download/v${version}/${asset}"
+          jq -n --arg version "$version" --arg url "$url" --arg sha256 "$sha256" \
+            '{version:$version,url:$url,sha256:$sha256}' > update-manifest.json
+          cat update-manifest.json
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          generate_release_notes: true
+          files: |
+            zcode-account-manager-0*
+            update-manifest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zcode-account-manager-linux-x86_64
+          path: zcode-account-manager-0*

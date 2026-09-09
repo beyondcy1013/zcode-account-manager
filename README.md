@@ -135,7 +135,7 @@ zcode-account-manager send --pinned 1 --message "早报" --at 09:30 --daily # �
 命令行兼容模式仍保留；设置环境变量 `ZCODE_LANG=en` 后显示英文交互文本。程序内置 GitHub Release 更新地址，可运行 `zcode-account-manager.exe --check-update` 手动检查；`ZCODE_UPDATE_MANIFEST_URL` 可覆盖默认地址。清单格式：
 
 ```json
-{"version":"0.5.0","url":"https://github.com/beyondcy1013/zcode-account-manager/releases/latest/download/zcode-account-manager-0.5.0.exe"}
+{"version":"0.5.0","url":"https://github.com/beyondcy1013/zcode-account-manager/releases/latest/download/zcode-account-manager-0.5.0"}
 ```
 
 ## 清理效果示例
@@ -176,7 +176,7 @@ cargo test
 cargo build --release
 ```
 
-生成文件位于 `target\release\zcode-account-manager.exe`。仓库中的 GitHub Actions 也会在推送 `v*` 标签时构建 Windows x86_64 EXE。
+生成文件位于 `target/release/zcode-account-manager`。仓库中的 GitHub Actions 也会在推送 `v*` 标签时构建 Linux x86_64 可执行文件并发布 Release。
 
 ### 7. 平台支持
 
