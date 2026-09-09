@@ -40,6 +40,30 @@
 
 ---
 
+## Gemini 账号管理
+
+「Gemini 账号」页为 **Google Gemini CLI**（`gemini` 命令行）提供与 ZCode 一致的多账号体验：备份当前登录状态，在多个 Google 账号之间一键切换。
+
+1. 用 Gemini CLI 登录一个 Google 账号后，打开「Gemini 账号」页，工具会自动识别当前账号（邮箱、认证方式、凭据指纹）并显示在「当前 Gemini 账号」栏。
+2. 点击 **保存当前账号** 创建备份；名称留空时自动用邮箱前缀命名（如 `someone`），也可填一个好记的**别名**。
+3. 登录其他账号并分别保存，之后随时在列表中点击 **切换**：切换前当前状态会自动备份到原账号，目标恢复失败时自动回滚。
+
+备份保存在 `~/.gemini/account_backups/`（Windows 为 `%USERPROFILE%\.gemini\account_backups\`），快照内容：
+
+| 快照项 | 路径（`~/.gemini/` 下） | 说明 |
+| :--- | :--- | :--- |
+| **OAuth 凭据** | `oauth_creds.json` | OAuth 登录 Token；凭据指纹按 `refresh_token` 计算，token 刷新不影响账号匹配 |
+| **账号缓存** | `google_accounts.json` | 缓存的 Google 账号邮箱（当前账号识别来源之一） |
+| **Web 账号缓存** | `google_web_accounts.json` | Web 登录账号缓存（存在时纳入快照） |
+| **客户端设置** | `settings.json` | 客户端设置，含认证方式选择；旧快照缺失此项时保留本机现状不清空 |
+| **ADC 凭据** | `application_default_credentials.json` | Vertex AI / 应用默认凭据（存在时纳入快照） |
+
+> ⚠️ 切换前请退出正在运行的 `gemini` 会话：运行中的会话可能在切换后把旧登录凭据回写覆盖。工具检测到 Gemini CLI 运行时会在界面上给出提示；切换完成后重启 `gemini` 即可使用新账号。
+
+> 账户快照包含 OAuth 登录凭据，请像保护密码一样保护备份目录，不要上传或分享。
+
+---
+
 ## 🔍 深度原理解析 (Why & How)
 
 ### 1. 为什么“新安装客户端”会弹出领取 Flash 免费套餐？
@@ -82,7 +106,7 @@
 
 发布文件 `zcode-account-manager.exe` 不需要 Python 或其他运行时。
 
-直接双击 EXE 会打开 **ZCode 账户管家**。账户页用于备份、更新、切换和删除账户快照；清理页提供安全清理和完整重置；「自动发送」页可以向 ZCode 桌面端的指定会话自动发送消息。所有会改动本地状态的操作都有明确状态反馈和二次确认。
+直接双击 EXE 会打开 **ZCode 账户管家**。账户页用于备份、更新、切换和删除 ZCode 账户快照；「Gemini 账号」页为 Gemini CLI 提供同样的多账号备份与切换；清理页提供安全清理和完整重置；「自动发送」页可以向 ZCode 桌面端的指定会话自动发送消息。所有会改动本地状态的操作都有明确状态反馈和二次确认。
 
 ## 自动发送消息（Linux X11）
 
