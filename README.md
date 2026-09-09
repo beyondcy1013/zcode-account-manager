@@ -42,9 +42,9 @@
 
 ## Gemini 账号管理
 
-「Gemini 账号」页为 **Google Gemini CLI**（`gemini` 命令行）提供与 ZCode 一致的多账号体验：备份当前登录状态，在多个 Google 账号之间一键切换。
+「Gemini 账号」页为 **Google Gemini CLI** 及其继任者 **Antigravity CLI（`agy`）** 提供多账号体验：Gemini CLI 已并入 Antigravity CLI，两者共用 `~/.gemini` 目录，本工具对两者同时支持——备份当前登录状态，在多个 Google 账号之间一键切换。
 
-1. 用 Gemini CLI 登录一个 Google 账号后，打开「Gemini 账号」页，工具会自动识别当前账号（邮箱、认证方式、凭据指纹）并显示在「当前 Gemini 账号」栏。
+1. 用 Gemini CLI 或 `agy` 登录一个 Google 账号后，打开「Gemini 账号」页，工具会自动识别当前账号（邮箱、认证方式、凭据指纹）并显示在「当前 Gemini 账号」栏。
 2. 点击 **保存当前账号** 创建备份；名称留空时自动用邮箱前缀命名（如 `someone`），也可填一个好记的**别名**。
 3. 登录其他账号并分别保存，之后随时在列表中点击 **切换**：切换前当前状态会自动备份到原账号，目标恢复失败时自动回滚。
 
@@ -52,13 +52,17 @@
 
 | 快照项 | 路径（`~/.gemini/` 下） | 说明 |
 | :--- | :--- | :--- |
-| **OAuth 凭据** | `oauth_creds.json` | OAuth 登录 Token；凭据指纹按 `refresh_token` 计算，token 刷新不影响账号匹配 |
-| **账号缓存** | `google_accounts.json` | 缓存的 Google 账号邮箱（当前账号识别来源之一） |
+| **agy OAuth 凭据** | `antigravity-cli/antigravity-oauth-token` | Antigravity CLI 登录 Token；指纹按内层 `refresh_token` 计算，token 刷新不影响账号匹配 |
+| **agy 设置** | `antigravity-cli/settings.json` | agy 客户端设置（模型、权限等）；旧快照缺失此项时保留本机现状 |
+| **OAuth 凭据** | `oauth_creds.json` | 旧版 Gemini CLI 登录 Token（含 id_token，用于识别邮箱） |
+| **账号缓存** | `google_accounts.json` | 旧版 Gemini CLI 缓存的账号邮箱 |
 | **Web 账号缓存** | `google_web_accounts.json` | Web 登录账号缓存（存在时纳入快照） |
-| **客户端设置** | `settings.json` | 客户端设置，含认证方式选择；旧快照缺失此项时保留本机现状不清空 |
+| **客户端设置** | `settings.json` | 旧版 Gemini CLI 设置，含认证方式选择；旧快照缺失此项时保留本机现状 |
 | **ADC 凭据** | `application_default_credentials.json` | Vertex AI / 应用默认凭据（存在时纳入快照） |
 
-> ⚠️ 切换前请退出正在运行的 `gemini` 会话：运行中的会话可能在切换后把旧登录凭据回写覆盖。工具检测到 Gemini CLI 运行时会在界面上给出提示；切换完成后重启 `gemini` 即可使用新账号。
+> 邮箱识别：旧版 Gemini CLI 从 `google_accounts.json` / id_token 读取；`agy` 的 token 文件不含邮箱，改为从其认证日志（`antigravity-cli/log/` 中的 `applyAuthResult: email=...`）尽力提取，日志被清理时仅影响显示名称，不影响凭据指纹与账号匹配。
+
+> ⚠️ 切换前请退出正在运行的 `gemini` / `agy` 会话：运行中的会话可能在切换后把旧登录凭据回写覆盖。工具检测到相关 CLI 运行时会在界面上给出提示；切换完成后重启会话即可使用新账号。
 
 > 账户快照包含 OAuth 登录凭据，请像保护密码一样保护备份目录，不要上传或分享。
 

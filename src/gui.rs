@@ -791,13 +791,13 @@ impl ZCodeApp {
     fn gemini_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Gemini 账号备份与切换");
         ui.label(
-            "管理 Google Gemini CLI（~/.gemini）的登录账号：备份当前账号，在多个 Gemini 账号间一键切换。切换会整体替换 OAuth 凭据与账号缓存。",
+            "管理 Google Gemini CLI / Antigravity CLI（agy，Gemini CLI 的继任者，两者共用 ~/.gemini）的登录账号：备份当前账号，在多个 Google 账号间一键切换。切换会整体替换 OAuth 凭据与账号缓存。",
         );
         ui.add_space(8.0);
         if self.gemini_cli_running {
             ui.colored_label(
                 Color32::from_rgb(190, 112, 28),
-                "检测到 Gemini CLI 正在运行：切换或更新备份前请先退出相关会话，否则旧会话可能把登录凭据回写覆盖。",
+                "检测到 Gemini CLI / agy 正在运行：切换或更新备份前请先退出相关会话，否则旧会话可能把登录凭据回写覆盖。",
             );
         }
         self.gemini_identity_banner(ui);
@@ -842,7 +842,7 @@ impl ZCodeApp {
                 ui.vertical_centered(|ui| {
                     ui.add_space(18.0);
                     ui.label(RichText::new("还没有 Gemini 账号备份").strong());
-                    ui.label("先用 Gemini CLI 登录一个 Google 账号，再点击上方「保存当前账号」创建备份。");
+                    ui.label("先用 Gemini CLI 或 Antigravity CLI（agy）登录一个 Google 账号，再点击上方「保存当前账号」创建备份。");
                     ui.label("创建后列表每一行都会出现「切换」按钮，随时一键换号。");
                 });
             });
@@ -1068,13 +1068,13 @@ impl ZCodeApp {
                     .map(|profile| profile.manifest.display_name().to_string())
                     .unwrap_or_default();
                 let running_hint = if self.gemini_cli_running {
-                    "检测到 Gemini CLI 正在运行，切换后请重启相关 gemini 会话，避免旧会话回写登录凭据。"
+                    "检测到 Gemini CLI / agy 正在运行，切换后请重启相关会话，避免旧会话回写登录凭据。"
                 } else {
                     ""
                 };
                 (
                     "确认切换 Gemini 账号",
-                    format!("将把 Gemini CLI 本地登录状态切换为「{name}」。当前状态会先自动备份到该账号。{running_hint}"),
+                    format!("将把 Gemini / Antigravity CLI 本地登录状态切换为「{name}」。当前状态会先自动备份到该账号。{running_hint}"),
                     "开始切换",
                 )
             }
