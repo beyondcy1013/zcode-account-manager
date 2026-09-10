@@ -47,6 +47,8 @@ pub struct ToolStore {
     pub tags: &'static [&'static str],
     /// 配置类项目：快照缺失时保留本机现状而不是清空。
     pub preserve_if_absent: &'static [&'static str],
+    /// 「清空账号」时要删除的登录凭据项目（tags 的子集），删完即恢复未登录状态。
+    pub clear_tags: &'static [&'static str],
     /// 从本地文件识别当前账号。
     pub detect: fn(&Roots) -> CliIdentity,
     /// 检测运行中会话的 pgrep -f 模式（仅类 Unix 平台使用）。
@@ -367,6 +369,47 @@ impl ToolStore {
         Ok(())
     }
 
+    /// 清空登录状态，恢复到未登录的原始状态，方便重新登录。
+    /// 清空前自动备份当前状态（与既有备份指纹一致时更新它而不是新建），
+    /// 之后随时可以在列表中切回。返回自动备份的展示名；已是未登录状态
+    /// （没有任何可清除内容）时返回 None。
+    pub fn clear_account(&self, roots: &Roots) -> Result<Option<String>, String> {
+        let has_files = self
+            .tags
+            .iter()
+            .any(|tag| self.resolve(roots, tag).exists());
+        let backup_name = if has_files {
+            let identity = (self.detect)(roots);
+            let existing = identity.fingerprint.as_deref().and_then(|fingerprint| {
+                self.list_accounts(roots).ok()?.into_iter().find(|profile| {
+                    profile.manifest.fingerprint.as_deref() == Some(fingerprint)
+                })
+            });
+            // 更新已有备份时沿用其名称，避免自动改名
+            let name = existing
+                .as_ref()
+                .map(|profile| profile.manifest.name.as_str());
+            let profile = self.save_current_account(roots, name, existing.as_ref())?;
+            Some(profile.manifest.display_name().to_string())
+        } else {
+            None
+        };
+        let mut removed = false;
+        for tag in self.clear_tags {
+            let path = self.resolve(roots, tag);
+            if path.exists() {
+                remove_path(&path).map_err(|error| format!("清除 {tag} 失败: {error}"))?;
+                removed = true;
+            }
+        }
+        set_active_account(self, roots, None)?;
+        Ok(if removed || backup_name.is_some() {
+            backup_name
+        } else {
+            None
+        })
+    }
+
     pub fn active_account(&self, roots: &Roots) -> Option<String> {
         let bytes = fs::read(self.accounts_root(roots).join("active.json")).ok()?;
         serde_json::from_slice::<ActiveAccount>(&bytes)
@@ -494,6 +537,7 @@ mod tests {
     ];
     static TEST_TAGS: &[&str] = &["creds", "cfg"];
     static TEST_PRESERVE: &[&str] = &["cfg"];
+    static TEST_CLEAR: &[&str] = &["creds"];
     static TEST_STORE: ToolStore = ToolStore {
         key: "testtool",
         tab: "Test",
@@ -505,6 +549,7 @@ mod tests {
         paths: TEST_PATHS,
         tags: TEST_TAGS,
         preserve_if_absent: TEST_PRESERVE,
+        clear_tags: TEST_CLEAR,
         detect: |_| CliIdentity::default(),
         process_pattern: r"(^|/)testcli( |$)",
     };
@@ -589,5 +634,38 @@ mod tests {
         assert_eq!(identity.default_name("Codex").as_deref(), Some("Codex84ac0f0d"));
         identity.email = Some("someone@example.com".into());
         assert_eq!(identity.default_name("Codex").as_deref(), Some("someone"));
+    }
+
+    #[test]
+    fn clear_backs_up_then_removes_credentials_and_keeps_config() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        let creds = TEST_STORE.path_by_tag(&roots, "creds");
+        let cfg = TEST_STORE.path_by_tag(&roots, "cfg");
+        fs::create_dir_all(creds.parent().unwrap()).unwrap();
+        fs::write(&creds, b"login-state").unwrap();
+        fs::write(&cfg, b"user-config").unwrap();
+
+        let backup_name = TEST_STORE.clear_account(&roots).unwrap();
+        assert_eq!(backup_name.as_deref(), Some("我的Test账号"));
+        assert!(!creds.exists(), "登录凭据应被清除");
+        assert_eq!(fs::read(&cfg).unwrap(), b"user-config", "用户配置应保留");
+        assert_eq!(TEST_STORE.active_account(&roots), None);
+
+        // 自动备份可从列表找回，数据完整可切回
+        let profiles = TEST_STORE.list_accounts(&roots).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            fs::read(profiles[0].directory.join("data").join("creds")).unwrap(),
+            b"login-state"
+        );
+    }
+
+    #[test]
+    fn clear_is_noop_when_already_logged_out() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        assert_eq!(TEST_STORE.clear_account(&roots).unwrap(), None);
+        assert_eq!(TEST_STORE.list_accounts(&roots).unwrap().len(), 0);
     }
 }

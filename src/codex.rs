@@ -24,6 +24,8 @@ static CODEX_PATHS: &[ToolPath] = &[
 static CODEX_TAGS: &[&str] = &["auth", "config"];
 /// config.toml 是用户配置：快照缺失时保留本机现状。
 static CODEX_PRESERVE_IF_ABSENT: &[&str] = &["config"];
+/// 「清空账号」只删登录凭据；config.toml 是用户配置，保留。
+static CODEX_CLEAR_TAGS: &[&str] = &["auth"];
 
 pub fn codex_dir(roots: &Roots) -> PathBuf {
     roots.user_profile.join(".codex")
@@ -40,6 +42,7 @@ pub static STORE: ToolStore = ToolStore {
     paths: CODEX_PATHS,
     tags: CODEX_TAGS,
     preserve_if_absent: CODEX_PRESERVE_IF_ABSENT,
+    clear_tags: CODEX_CLEAR_TAGS,
     detect,
     process_pattern: r"(^|/)codex( |$)",
 };

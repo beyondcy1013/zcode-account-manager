@@ -58,6 +58,15 @@ static GEMINI_TAGS: &[&str] = &[
 /// 用户配置类项目：快照缺失时保留本机现状而不是清空，避免旧备份切换清掉
 /// 用户自定义设置（含认证方式选择）。
 static GEMINI_PRESERVE_IF_ABSENT: &[&str] = &["settings", "agy_settings"];
+/// 「清空账号」要删除的登录凭据与账号缓存（保留 agy_settings 个性化设置）。
+static GEMINI_CLEAR_TAGS: &[&str] = &[
+    "agy_oauth_token",
+    "oauth_creds",
+    "google_accounts",
+    "google_web_accounts",
+    "settings",
+    "adc_creds",
+];
 
 pub fn gemini_dir(roots: &Roots) -> PathBuf {
     roots.user_profile.join(".gemini")
@@ -74,6 +83,7 @@ pub static STORE: ToolStore = ToolStore {
     paths: GEMINI_PATHS,
     tags: GEMINI_TAGS,
     preserve_if_absent: GEMINI_PRESERVE_IF_ABSENT,
+    clear_tags: GEMINI_CLEAR_TAGS,
     detect,
     process_pattern: r"(^|/)(gemini|agy)( |$)",
 };
@@ -515,6 +525,43 @@ mod tests {
         assert_eq!(renamed.manifest.display_name(), "主力 Gmail");
         let reloaded = STORE.list_accounts(&roots).unwrap().remove(0);
         assert_eq!(reloaded.manifest.display_name(), "主力 Gmail");
+    }
+
+    #[test]
+    fn clear_updates_matched_backup_instead_of_duplicating() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        write_file(
+            &roots,
+            "oauth_creds",
+            br#"{"access_token":"a1","refresh_token":"r1"}"#,
+        );
+        let saved = STORE.save_current_account(&roots, Some("我的号"), None).unwrap();
+
+        // 清空：指纹与既有备份一致 → 更新它而不是新建，凭据被删除
+        let cleared = STORE.clear_account(&roots).unwrap();
+        assert_eq!(cleared.as_deref(), Some("我的号"));
+        assert!(!STORE.path_by_tag(&roots, "oauth_creds").exists());
+        assert_eq!(STORE.active_account(&roots), None);
+        assert_eq!(STORE.list_accounts(&roots).unwrap().len(), 1);
+
+        // 再次登录同一账号（refresh_token 不变）后再清空：仍只有一份备份且内容已更新
+        write_file(
+            &roots,
+            "oauth_creds",
+            br#"{"access_token":"a1-new","refresh_token":"r1"}"#,
+        );
+        assert!(STORE.clear_account(&roots).unwrap().is_some());
+        let profiles = STORE.list_accounts(&roots).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].manifest.id, saved.manifest.id);
+        assert_eq!(
+            fs::read(profiles[0].directory.join("data").join("oauth_creds")).unwrap(),
+            br#"{"access_token":"a1-new","refresh_token":"r1"}"#,
+        );
+
+        // 已是未登录状态时无需清空
+        assert_eq!(STORE.clear_account(&roots).unwrap(), None);
     }
 
     #[test]

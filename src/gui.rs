@@ -40,6 +40,8 @@ enum ConfirmAction {
     /// 按 TOOL_STORES 下标定位工具。
     ToolSwitch(usize, String),
     ToolDelete(usize, String),
+    /// 清空该工具的登录状态，恢复未登录原始状态。
+    ToolClear(usize),
     Clean(bool),
     AutoSend {
         request: AutoSendRequest,
@@ -503,6 +505,24 @@ impl ZCodeApp {
                     Err(error) => self.set_error(error),
                 }
             }
+            ConfirmAction::ToolClear(tool_index) => {
+                let Some(store) = self.tools.get(tool_index).map(|tool| tool.store) else {
+                    return;
+                };
+                match store.clear_account(&self.roots) {
+                    Ok(Some(name)) => {
+                        self.refresh();
+                        self.set_ok(format!(
+                            "已清空 {} 登录状态（已备份为「{name}」），可重新登录或随时切换回来",
+                            store.display
+                        ));
+                    }
+                    Ok(None) => {
+                        self.set_ok(format!("{} 已是未登录状态，无需清空", store.display));
+                    }
+                    Err(error) => self.set_error(error),
+                }
+            }
             ConfirmAction::Clean(safe) => {
                 if zcode_running() {
                     self.set_error("请先完全退出 ZCode，再执行清理");
@@ -908,6 +928,13 @@ impl ZCodeApp {
                     Err(error) => self.set_error(error),
                 }
             }
+            if ui
+                .button(RichText::new("清空账号").color(Color32::from_rgb(180, 48, 48)))
+                .on_hover_text("自动备份当前登录状态后清除凭据，恢复到未登录的原始状态，方便重新登录其他账号")
+                .clicked()
+            {
+                self.confirm = Some(ConfirmAction::ToolClear(tool_index));
+            }
         });
         ui.add_space(14.0);
 
@@ -1179,6 +1206,25 @@ impl ZCodeApp {
                         tool.store.display
                     ),
                     "确认删除",
+                )
+            }
+            ConfirmAction::ToolClear(tool_index) => {
+                let tool = &self.tools[*tool_index];
+                let running_hint = if tool.cli_running {
+                    format!(
+                        "检测到 {} 正在运行，请先退出会话再清空，否则旧会话可能把凭据回写。",
+                        tool.store.cli_names
+                    )
+                } else {
+                    String::new()
+                };
+                (
+                    "清空账号（退出登录）",
+                    format!(
+                        "将先自动备份当前 {} 登录状态（与已有备份是同一账号时更新它），然后清除登录凭据，恢复到未登录的原始状态。之后可重新登录，也可随时从列表切换回该账号。{running_hint}",
+                        tool.store.display
+                    ),
+                    "清空并退出登录",
                 )
             }
             ConfirmAction::Clean(true) => (

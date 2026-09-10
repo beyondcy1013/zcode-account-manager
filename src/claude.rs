@@ -27,6 +27,9 @@ static CLAUDE_PATHS: &[ToolPath] = &[
 static CLAUDE_TAGS: &[&str] = &["credentials", "settings"];
 /// settings.json 是用户配置（含端点认证）：快照缺失时保留本机现状。
 static CLAUDE_PRESERVE_IF_ABSENT: &[&str] = &["settings"];
+/// 「清空账号」删除 OAuth 凭据与 settings.json（其中的 env Token 就是端点
+/// 账号的登录状态，清掉才恢复未登录；清空前会自动备份，可随时切回）。
+static CLAUDE_CLEAR_TAGS: &[&str] = &["credentials", "settings"];
 
 pub fn claude_dir(roots: &Roots) -> PathBuf {
     roots.user_profile.join(".claude")
@@ -43,6 +46,7 @@ pub static STORE: ToolStore = ToolStore {
     paths: CLAUDE_PATHS,
     tags: CLAUDE_TAGS,
     preserve_if_absent: CLAUDE_PRESERVE_IF_ABSENT,
+    clear_tags: CLAUDE_CLEAR_TAGS,
     detect,
     process_pattern: r"(^|/)claude( |$)",
 };
