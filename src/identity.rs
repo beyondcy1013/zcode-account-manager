@@ -162,13 +162,20 @@ pub fn decode_jwt_identity(token: &str) -> Option<String> {
 
 /// `zcode status` 输出 JSON（含 user.username / user.id / provider），3 秒内未返回则放弃。
 fn detect_from_cli(identity: &mut AccountIdentity) {
-    let mut child = match Command::new("zcode")
+    let mut command = Command::new("zcode");
+    command
         .arg("status")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    #[cfg(windows)]
     {
+        // Windows 上 zcode 是控制台程序：GUI 调用时不能弹出黑框
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return,
     };

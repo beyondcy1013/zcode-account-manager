@@ -154,6 +154,9 @@ pub struct ZCodeApp {
     tools: Vec<ToolAccounts>,
     /// CLI 账号页当前选中的工具下标。
     tool_page: usize,
+    /// ZCode 运行状态缓存：由后台线程每 2 秒探测，界面帧只读缓存。
+    /// 逐帧同步调用 tasklist 在 Windows 上会反复弹黑框并阻塞 UI。
+    zcode_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ZCodeApp {
@@ -203,6 +206,7 @@ impl ZCodeApp {
                 .map(|store| ToolAccounts::new(store))
                 .collect(),
             tool_page: 0,
+            zcode_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         app.refresh();
         if app.account_name.is_empty() {
@@ -217,10 +221,21 @@ impl ZCodeApp {
                 }
             }
         }
+        // 后台轮询 ZCode 运行状态，界面帧只读缓存值
+        let shared_running = app.zcode_running.clone();
+        let poll_ctx = cc.egui_ctx.clone();
+        std::thread::spawn(move || loop {
+            let running = crate::zcode_running();
+            shared_running.store(running, Ordering::SeqCst);
+            poll_ctx.request_repaint();
+            std::thread::sleep(Duration::from_secs(2));
+        });
         app
     }
 
     fn refresh(&mut self) {
+        self.zcode_running
+            .store(zcode_running(), Ordering::SeqCst);
         match list_accounts(&self.roots) {
             Ok(accounts) => {
                 self.accounts = accounts;
@@ -1716,7 +1731,7 @@ impl eframe::App for ZCodeApp {
                         tray::EXIT_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    let running = zcode_running();
+                    let running = self.zcode_running.load(Ordering::SeqCst);
                     ui.colored_label(
                         if running {
                             Color32::from_rgb(190, 112, 28)

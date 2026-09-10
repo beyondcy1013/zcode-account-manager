@@ -317,6 +317,22 @@ const DESKTOP_PROCESS_NAME: &str = "ZCode";
 /// 结束 ZCode 前记录的桌面客户端可执行文件路径；关闭后只有它知道该重启哪个程序。
 static REMEMBERED_ZCODE_EXE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+/// 以隐藏控制台窗口的方式构造子进程命令：GUI 程序在 Windows 上调用
+/// tasklist/taskkill/powershell/curl 等控制台程序时，默认会为每个子进程
+/// 弹出黑色控制台窗口并阻塞界面。
+pub(crate) fn silent_command(program: &str) -> Command {
+    // Linux 上没有 creation_flags，mut 仅 Windows 分支使用
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// 探测正在运行的 ZCode 桌面客户端的真实可执行文件路径。
 #[cfg(not(windows))]
 fn detect_zcode_desktop_exe() -> Option<PathBuf> {
@@ -344,7 +360,7 @@ fn detect_zcode_desktop_exe() -> Option<PathBuf> {
 /// Windows 上用 PowerShell 查询 ZCode.exe 的真实路径。
 #[cfg(windows)]
 fn detect_zcode_desktop_exe() -> Option<PathBuf> {
-    let output = Command::new("powershell")
+    let output = silent_command("powershell")
         .args([
             "-NoProfile",
             "-Command",
@@ -367,7 +383,7 @@ fn remember_zcode_desktop_exe() {
 
 fn zcode_running() -> bool {
     #[cfg(windows)]
-    return Command::new("tasklist")
+    return silent_command("tasklist")
         .args(["/FI", "IMAGENAME eq ZCode.exe", "/FO", "CSV", "/NH"])
         .output()
         .map(|out| {
@@ -399,7 +415,7 @@ const DEFAULT_UPDATE_MANIFEST_URL: &str = "https://github.com/beyondcy1013/zcode
 fn fetch_update() -> Result<Option<UpdateManifest>, String> {
     let url = env::var_os("ZCODE_UPDATE_MANIFEST_URL")
         .unwrap_or_else(|| DEFAULT_UPDATE_MANIFEST_URL.into());
-    let output = Command::new("curl")
+    let output = silent_command("curl")
         .args(["-fsSL", "--max-time", "5"])
         .arg(url)
         .output();
@@ -455,7 +471,7 @@ fn install_update(update: &UpdateManifest) -> Result<(), String> {
             "[Update] Downloading new version..."
         )
     );
-    let status = Command::new("curl")
+    let status = silent_command("curl")
         .args(["-fL", "--retry", "2", "-o"])
         .arg(&next)
         .arg(&update.url)
@@ -521,7 +537,7 @@ fn terminate_zcode() -> Result<(), String> {
     remember_zcode_desktop_exe();
     println!("[步骤 2/4] 正在强行结束 ZCode 进程...");
     #[cfg(windows)]
-    let result = Command::new("taskkill")
+    let result = silent_command("taskkill")
         .args(["/F", "/T", "/IM", "ZCode.exe"])
         .output();
     #[cfg(not(windows))]
