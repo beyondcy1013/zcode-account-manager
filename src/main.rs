@@ -1140,17 +1140,26 @@ fn run() -> Result<(), String> {
 /// windows_subsystem="windows" 的进程不自带控制台；带命令行参数启动时附着父进程
 /// 控制台并重定向标准句柄，保证 inspect/backup/clean 等 CLI 子命令可见可用。
 /// 双击打开 GUI 时不调用，不会闪现控制台窗口。
+/// stdout 已被重定向（文件/管道）时保持原样：既让输出可被捕获，也避免抢占
+/// 调用方设置的句柄。
 #[cfg(windows)]
 fn attach_parent_console() {
     use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFileType;
     use windows_sys::Win32::System::Console::{
-        AttachConsole, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
-        STD_OUTPUT_HANDLE,
+        AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
+    /// FILE_TYPE_CHAR：句柄指向控制台设备
+    const FILE_TYPE_CHAR: u32 = 0x0002;
     if env::args_os().len() <= 1 {
         return;
     }
     unsafe {
+        let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        if GetFileType(stdout) != FILE_TYPE_CHAR {
+            return;
+        }
         if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
             return;
         }

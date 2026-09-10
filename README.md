@@ -65,6 +65,8 @@
 
 > 邮箱识别：旧版 Gemini CLI 从 `google_accounts.json` / id_token 读取；`agy` 的 token 文件不含邮箱，改为从其认证日志（`antigravity-cli/log/` 中的 `applyAuthResult: email=...`）尽力提取，日志被清理时仅影响显示名称，不影响凭据指纹与账号匹配。
 
+> **Windows 版 agy ≥ 1.2.0**：登录 Token 存放在 Windows 凭据管理器（keyring，条目 `gemini:antigravity`），本地没有 token 文件。工具会从认证日志识别账号（邮箱 + 认证方式，指纹按邮箱摘要计算）；文件级快照仍可备份 agy 设置与旧版 Gemini CLI 文件，但 OAuth 登录本体不受快照管理——在 Windows 上切换/退出 Google OAuth 账号请使用 `agy` 自身的 `login` / `logout`。
+
 **Codex CLI**（`~/.codex/account_backups/`）：
 
 | 快照项 | 路径（`~/.codex/` 下） | 说明 |

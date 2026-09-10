@@ -11,7 +11,7 @@ use std::{
     env,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -446,6 +446,7 @@ impl ToolStore {
         }
         #[cfg(not(windows))]
         {
+            use std::process::Stdio;
             Command::new("pgrep")
                 .args(["-f", self.process_pattern])
                 .stdout(Stdio::null())
@@ -570,6 +571,7 @@ pub fn launch_cli_session(store: &ToolStore) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
+        use std::process::Stdio;
         let terminals: Vec<(String, TerminalArg)> = match env::var("ZCODE_CLI_TERMINAL") {
             Ok(custom) if !custom.trim().is_empty() => vec![(custom, TerminalArg::DashE)],
             _ => TERMINALS

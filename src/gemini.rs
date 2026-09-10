@@ -95,8 +95,14 @@ pub fn detect(roots: &Roots) -> CliIdentity {
     let gemini = gemini_dir(roots);
     let mut identity = CliIdentity::default();
 
-    // Antigravity CLI（agy）：token 文件含内层 Google OAuth token 与 auth_method
-    let agy_token = gemini.join("antigravity-cli").join("antigravity-oauth-token");
+    // Antigravity CLI（agy）：
+    // - 1.1.x：登录 Token 在 antigravity-cli/antigravity-oauth-token 文件中，
+    //   指纹取内层 refresh_token，邮箱来自认证日志；
+    // - 1.2.0 起（Windows 实测）：Token 移入系统凭据管理器（keyring，目标
+    //   gemini:antigravity），本地无 token 文件，改由认证日志识别邮箱与
+    //   认证方式，指纹退回邮箱摘要（同一账号稳定，可与其他账号区分）。
+    let agy_dir = gemini.join("antigravity-cli");
+    let agy_token = agy_dir.join("antigravity-oauth-token");
     if let Ok(bytes) = fs::read(&agy_token) {
         let value = serde_json::from_slice::<Value>(&bytes).ok();
         identity.fingerprint = Some(agy_fingerprint(&bytes, value.as_ref()));
@@ -105,8 +111,20 @@ pub fn detect(roots: &Roots) -> CliIdentity {
             .and_then(|value| value.get("auth_method"))
             .and_then(Value::as_str)
             .map(agy_auth_label);
-        // agy 的 token 文件不含 id_token，邮箱只能从认证日志尽力提取
-        identity.email = agy_email_from_logs(&gemini.join("antigravity-cli"));
+        // token 文件不含 id_token，邮箱只能从认证日志尽力提取
+        if let Some(log_auth) = agy_log_auth(&agy_dir) {
+            identity.email = identity.email.or(log_auth.email);
+            if identity.auth_type.is_none() {
+                identity.auth_type = log_auth.auth_method.map(|m| agy_auth_label(&m));
+            }
+        }
+    } else if let Some(log_auth) = agy_log_auth(&agy_dir) {
+        identity.email = log_auth.email;
+        identity.auth_type = log_auth.auth_method.map(|m| agy_auth_label(&m));
+        identity.fingerprint = identity
+            .email
+            .as_deref()
+            .map(|email| short_digest(email.as_bytes()));
     }
 
     // 旧版 Gemini CLI：google_accounts / oauth_creds(含 id_token)
@@ -204,9 +222,18 @@ fn agy_fingerprint(bytes: &[u8], value: Option<&Value>) -> String {
     }
 }
 
-/// 从 agy 认证日志提取账号邮箱（尽力而为）。每次 CLI 启动认证成功都会写入
-/// `applyAuthResult: email=...` 日志；日志被清理时返回 None，不影响指纹匹配。
-fn agy_email_from_logs(agy_dir: &Path) -> Option<String> {
+/// agy 最近一次登录的标识（尽力而为）。
+#[derive(Debug, Default, PartialEq)]
+struct AgyLogAuth {
+    email: Option<String>,
+    auth_method: Option<String>,
+}
+
+/// 从 agy 认证日志提取最近一次登录的邮箱与认证方式（尽力而为）。每次 CLI
+/// 启动认证成功都会写入 `applyAuthResult: email=...` 日志；Windows 上 Token
+/// 存于系统凭据管理器时，日志是唯一的本地识别来源。日志被清理时返回 None，
+/// 不影响凭据指纹与账号匹配。
+fn agy_log_auth(agy_dir: &Path) -> Option<AgyLogAuth> {
     let log_dir = agy_dir.join("log");
     let mut files: Vec<(SystemTime, PathBuf)> = fs::read_dir(log_dir)
         .ok()?
@@ -224,30 +251,43 @@ fn agy_email_from_logs(agy_dir: &Path) -> Option<String> {
         let Ok(content) = fs::read_to_string(path) else {
             continue;
         };
-        if let Some(email) = last_email_in_log(&content) {
-            return Some(email);
+        if let Some(auth) = last_auth_in_log(&content) {
+            return Some(auth);
         }
     }
     None
 }
 
-fn last_email_in_log(content: &str) -> Option<String> {
+fn last_auth_in_log(content: &str) -> Option<AgyLogAuth> {
     const AUTH_RESULT: &str = "applyAuthResult: email=";
     const AUTH_SUCCESS: &str = "authenticated successfully as ";
-    let mut found = None;
+    let mut auth = AgyLogAuth::default();
+    let mut matched = false;
     for line in content.lines() {
-        let candidate = if let Some(index) = line.find(AUTH_RESULT) {
-            line[index + AUTH_RESULT.len()..].split(',').next()
+        if let Some(index) = line.find(AUTH_RESULT) {
+            let rest = &line[index + AUTH_RESULT.len()..];
+            let mut fields = rest.split(',');
+            if let Some(email) = fields.next().map(str::trim).filter(|e| e.contains('@')) {
+                auth.email = Some(email.to_string());
+                matched = true;
+            }
+            for field in fields {
+                if let Some(method) = field.trim().strip_prefix("authMethod=") {
+                    let method = method.trim();
+                    if !method.is_empty() {
+                        auth.auth_method = Some(method.to_string());
+                    }
+                }
+            }
         } else if let Some(index) = line.find(AUTH_SUCCESS) {
-            Some(line[index + AUTH_SUCCESS.len()..].trim())
-        } else {
-            None
-        };
-        if let Some(value) = candidate.map(str::trim).filter(|value| value.contains('@')) {
-            found = Some(value.to_string());
+            let email = line[index + AUTH_SUCCESS.len()..].trim();
+            if email.contains('@') {
+                auth.email = Some(email.to_string());
+                matched = true;
+            }
         }
     }
-    found
+    matched.then_some(auth)
 }
 
 use std::{
@@ -497,6 +537,45 @@ mod tests {
             fs::read(&token_path).unwrap(),
             br#"{"token":{"refresh_token":"agy-r2"},"auth_method":"consumer"}"#,
         );
+    }
+
+    #[test]
+    fn keyring_mode_detects_identity_from_logs_without_token_file() {
+        // Windows agy 1.2.0：Token 存于系统凭据管理器，本地只有认证日志；
+        // 旧版 settings.json 残留的 gemini-api-key 不能覆盖 agy 的 OAuth 事实
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        let agy = gemini_dir(&roots).join("antigravity-cli");
+        fs::create_dir_all(agy.join("log")).unwrap();
+        fs::write(
+            agy.join("log").join("cli-20260910_203634.log"),
+            "I0910 20:36:35.684728 186 keyring.go:64] keyringAuth: loaded token, expired=false\nI0910 20:36:36.473353 185 auth.go:148] ChainedAuth: authenticated via keyring (effective: keyring)\nI0910 20:36:36.473353 185 server_oauth.go:192] applyAuthResult: email=dev@gmail.com, authMethod=consumer, quotaProject=\n",
+        )
+        .unwrap();
+        write_file(
+            &roots,
+            "settings",
+            br#"{"security":{"auth":{"selectedType":"gemini-api-key"}}}"#,
+        );
+
+        let identity = detect(&roots);
+        assert_eq!(identity.email.as_deref(), Some("dev@gmail.com"));
+        assert_eq!(identity.auth_type.as_deref(), Some("Antigravity 个人账号"));
+        assert!(identity.is_antigravity());
+        assert_eq!(identity.default_name("Gemini").as_deref(), Some("dev"));
+
+        // 无 token 文件时指纹退回邮箱摘要：同一账号稳定、异号可区分
+        let fingerprint = identity.fingerprint.clone().unwrap();
+        assert_eq!(fingerprint.len(), 12);
+        assert_eq!(
+            detect(&roots).fingerprint.as_deref(),
+            Some(fingerprint.as_str())
+        );
+
+        // 完全没有日志（被清理）时回落到旧版识别，显示 API Key 不算错
+        fs::remove_file(agy.join("log").join("cli-20260910_203634.log")).unwrap();
+        let without_log = detect(&roots);
+        assert_eq!(without_log.auth_type.as_deref(), Some("API Key"));
     }
 
     #[test]
