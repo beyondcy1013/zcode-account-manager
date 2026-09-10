@@ -1,6 +1,6 @@
 [package]
 name = "zcode-account-manager"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 description = "GUI account backup, switching, and local state management for ZCode on Windows"
 license = "MIT"

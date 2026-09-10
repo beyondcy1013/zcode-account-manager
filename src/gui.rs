@@ -42,6 +42,8 @@ enum ConfirmAction {
     ToolDelete(usize, String),
     /// 清空该工具的登录状态，恢复未登录原始状态。
     ToolClear(usize),
+    /// 切换完成后询问是否立即在新终端中启动 CLI 会话。
+    ToolRelaunch(usize, String),
     Clean(bool),
     AutoSend {
         request: AutoSendRequest,
@@ -474,14 +476,16 @@ impl ZCodeApp {
                     self.set_error("目标账号不存在");
                     return;
                 };
+                let name = profile.manifest.display_name().to_string();
                 match store.switch_account(&self.roots, &profile) {
                     Ok(()) => {
                         self.refresh();
                         self.set_ok(format!(
                             "已切换到 {} 账号 {}；正在运行的会话请重启后使用",
-                            store.display,
-                            profile.manifest.display_name()
+                            store.display, name
                         ));
+                        // 切换完成后询问是否立即启动新会话
+                        self.confirm = Some(ConfirmAction::ToolRelaunch(tool_index, name));
                     }
                     Err(error) => self.set_error(error),
                 }
@@ -520,6 +524,18 @@ impl ZCodeApp {
                     Ok(None) => {
                         self.set_ok(format!("{} 已是未登录状态，无需清空", store.display));
                     }
+                    Err(error) => self.set_error(error),
+                }
+            }
+            ConfirmAction::ToolRelaunch(tool_index, name) => {
+                let Some(store) = self.tools.get(tool_index).map(|tool| tool.store) else {
+                    return;
+                };
+                match cli_accounts::launch_cli_session(store) {
+                    Ok(()) => self.set_ok(format!(
+                        "已在终端窗口启动新的 {} 会话，使用账号「{name}」",
+                        store.display
+                    )),
                     Err(error) => self.set_error(error),
                 }
             }
@@ -1225,6 +1241,17 @@ impl ZCodeApp {
                         tool.store.display
                     ),
                     "清空并退出登录",
+                )
+            }
+            ConfirmAction::ToolRelaunch(tool_index, name) => {
+                let tool = &self.tools[*tool_index];
+                (
+                    "切换完成",
+                    format!(
+                        "已切换到 {} 账号「{name}」。是否立即打开一个终端窗口，启动新的 {} 会话以使用新账号？\n\n正在运行的旧会话不会受影响，退出后重新打开也会使用新账号。",
+                        tool.store.display, tool.store.cli_names
+                    ),
+                    "启动终端会话",
                 )
             }
             ConfirmAction::Clean(true) => (

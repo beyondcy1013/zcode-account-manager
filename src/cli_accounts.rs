@@ -8,6 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     cmp::Reverse,
+    env,
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -49,6 +50,8 @@ pub struct ToolStore {
     pub preserve_if_absent: &'static [&'static str],
     /// 「清空账号」时要删除的登录凭据项目（tags 的子集），删完即恢复未登录状态。
     pub clear_tags: &'static [&'static str],
+    /// 切换账号后启动新会话的候选 CLI 命令（按优先级，取 PATH 中第一个）。
+    pub launch_commands: &'static [&'static str],
     /// 从本地文件识别当前账号。
     pub detect: fn(&Roots) -> CliIdentity,
     /// 检测运行中会话的 pgrep -f 模式（仅类 Unix 平台使用）。
@@ -509,6 +512,109 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// 终端模拟器候选及其传参方式（仅类 Unix 平台使用）。
+#[derive(Clone, Copy)]
+#[cfg(not(windows))]
+enum TerminalArg {
+    /// `-e <命令>`
+    DashE,
+    /// `-x <命令>`（xfce4-terminal）
+    DashX,
+    /// `-- <命令>`（gnome-terminal）
+    DoubleDash,
+    /// 直接把命令作为参数（kitty）
+    Bare,
+}
+
+#[cfg(not(windows))]
+const TERMINALS: &[(&str, TerminalArg)] = &[
+    ("x-terminal-emulator", TerminalArg::DashE),
+    ("gnome-terminal", TerminalArg::DoubleDash),
+    ("konsole", TerminalArg::DashE),
+    ("xfce4-terminal", TerminalArg::DashX),
+    ("alacritty", TerminalArg::DashE),
+    ("kitty", TerminalArg::Bare),
+    ("xterm", TerminalArg::DashE),
+];
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let paths = env::var_os("PATH")?;
+    env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// 在新终端窗口中启动该工具的 CLI 会话（切换账号后让新凭据立即生效）。
+/// 环境变量 `ZCODE_CLI_TERMINAL` 可指定终端程序（按 `-e <命令>` 传参）。
+pub fn launch_cli_session(store: &ToolStore) -> Result<(), String> {
+    let cli = store
+        .launch_commands
+        .iter()
+        .find_map(|name| find_in_path(name))
+        .ok_or_else(|| {
+            format!(
+                "未在 PATH 中找到 {} 的 CLI 命令，请先安装或手动打开终端运行",
+                store.cli_names
+            )
+        })?;
+    let cli = cli.to_string_lossy().into_owned();
+
+    #[cfg(windows)]
+    {
+        let script = format!(r#"start "" cmd /k "{cli}""#);
+        Command::new("cmd")
+            .args(["/C", &script])
+            .spawn()
+            .map_err(|error| format!("启动终端失败: {error}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let terminals: Vec<(String, TerminalArg)> = match env::var("ZCODE_CLI_TERMINAL") {
+            Ok(custom) if !custom.trim().is_empty() => vec![(custom, TerminalArg::DashE)],
+            _ => TERMINALS
+                .iter()
+                .filter_map(|(name, style)| {
+                    find_in_path(name).map(|path| (path.to_string_lossy().into_owned(), *style))
+                })
+                .collect(),
+        };
+        let mut last_error = "未找到可用的终端程序，可设置环境变量 ZCODE_CLI_TERMINAL，或手动打开终端运行".to_string();
+        for (program, style) in terminals {
+            let mut command = Command::new(&program);
+            match style {
+                TerminalArg::DashE => {
+                    command.args(["-e", &cli]);
+                }
+                TerminalArg::DashX => {
+                    command.args(["-x", &cli]);
+                }
+                TerminalArg::DoubleDash => {
+                    command.args(["--", &cli]);
+                }
+                TerminalArg::Bare => {
+                    command.arg(&cli);
+                }
+            };
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // 终端窗口独立于本程序存活，脱离进程组避免信号联动
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let _ = command.process_group(0);
+            }
+            match command.spawn() {
+                Ok(_) => return Ok(()),
+                Err(error) => last_error = format!("启动终端 {program} 失败: {error}"),
+            }
+        }
+        Err(last_error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +656,7 @@ mod tests {
         tags: TEST_TAGS,
         preserve_if_absent: TEST_PRESERVE,
         clear_tags: TEST_CLEAR,
+        launch_commands: &["testcli"],
         detect: |_| CliIdentity::default(),
         process_pattern: r"(^|/)testcli( |$)",
     };
@@ -667,5 +774,10 @@ mod tests {
         let roots = roots(&temp);
         assert_eq!(TEST_STORE.clear_account(&roots).unwrap(), None);
         assert_eq!(TEST_STORE.list_accounts(&roots).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn missing_commands_are_not_found_in_path() {
+        assert_eq!(find_in_path("definitely-not-a-real-cli-xyz"), None);
     }
 }

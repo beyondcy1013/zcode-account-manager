@@ -43,6 +43,7 @@ pub static STORE: ToolStore = ToolStore {
     tags: CODEX_TAGS,
     preserve_if_absent: CODEX_PRESERVE_IF_ABSENT,
     clear_tags: CODEX_CLEAR_TAGS,
+    launch_commands: &["codex"],
     detect,
     process_pattern: r"(^|/)codex( |$)",
 };

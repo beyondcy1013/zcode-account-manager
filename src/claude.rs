@@ -47,6 +47,7 @@ pub static STORE: ToolStore = ToolStore {
     tags: CLAUDE_TAGS,
     preserve_if_absent: CLAUDE_PRESERVE_IF_ABSENT,
     clear_tags: CLAUDE_CLEAR_TAGS,
+    launch_commands: &["claude"],
     detect,
     process_pattern: r"(^|/)claude( |$)",
 };
