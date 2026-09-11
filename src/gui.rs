@@ -18,7 +18,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::identity::{self, AccountIdentity};
+use crate::identity::AccountIdentity;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -63,6 +63,17 @@ struct AccountEditor {
 struct ToolEditor {
     id: String,
     alias: String,
+}
+
+/// 后台慢速刷新的结果（进程探测、ZCode CLI 账号识别、CLI 会话探测），
+/// 完成后由 UI 线程取回应用，避免点击刷新时界面冻结且无反馈。
+struct RefreshOutcome {
+    /// 丢弃过期结果：begin_refresh 每次递增，不匹配则不应用。
+    tag: u64,
+    zcode_running: bool,
+    current_identity: AccountIdentity,
+    /// 与 TOOL_STORES 顺序一致：(账号标识, 是否有会话运行)。
+    tools: Vec<(cli_accounts::CliIdentity, bool)>,
 }
 
 /// 一个 CLI 工具在界面中的账号状态：列表、当前标识与编辑窗口。
@@ -157,6 +168,10 @@ pub struct ZCodeApp {
     /// ZCode 运行状态缓存：由后台线程每 2 秒探测，界面帧只读缓存。
     /// 逐帧同步调用 tasklist 在 Windows 上会反复弹黑框并阻塞 UI。
     zcode_running: Arc<std::sync::atomic::AtomicBool>,
+    /// 后台慢速刷新的结果槽与序号；refreshing 为 true 表示结果未回。
+    refresh_shared: Arc<Mutex<Option<RefreshOutcome>>>,
+    refresh_seq: u64,
+    refreshing: bool,
 }
 
 impl ZCodeApp {
@@ -178,12 +193,12 @@ impl ZCodeApp {
         if let Err(error) = tray::spawn(cc.egui_ctx.clone()) {
             eprintln!("{error}");
         }
-        let current_identity = identity::detect(&roots);
         let mut app = Self {
             roots,
             accounts: Vec::new(),
             active_id: None,
-            current_identity,
+            // 当前账号标识由启动后的首次后台刷新填充，避免窗口出现前卡顿数秒
+            current_identity: AccountIdentity::default(),
             account_name: String::new(),
             auto_restart: true,
             info_editor: None,
@@ -207,6 +222,9 @@ impl ZCodeApp {
                 .collect(),
             tool_page: 0,
             zcode_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            refresh_shared: Arc::new(Mutex::new(None)),
+            refresh_seq: 0,
+            refreshing: false,
         };
         app.refresh();
         if app.account_name.is_empty() {
@@ -221,6 +239,8 @@ impl ZCodeApp {
                 }
             }
         }
+        // 启动后立即后台补齐慢速信息（ZCode 进程状态、当前账号标识）
+        app.begin_refresh(&cc.egui_ctx);
         // 后台轮询 ZCode 运行状态，界面帧只读缓存值
         let shared_running = app.zcode_running.clone();
         let poll_ctx = cc.egui_ctx.clone();
@@ -233,9 +253,9 @@ impl ZCodeApp {
         app
     }
 
+    /// 快速刷新：只读本地文件（账号列表、active 标记、工具账号识别），
+    /// 立即让界面符合当前登录状态；进程与 CLI 级探测走 begin_refresh 后台。
     fn refresh(&mut self) {
-        self.zcode_running
-            .store(zcode_running(), Ordering::SeqCst);
         match list_accounts(&self.roots) {
             Ok(accounts) => {
                 self.accounts = accounts;
@@ -255,15 +275,77 @@ impl ZCodeApp {
             }
             // 工具账号识别只读本地文件，代价低，随列表一起刷新
             tool.identity = (store.detect)(&self.roots);
-            tool.cli_running = store.cli_running();
         }
         for error in errors {
             self.set_error(error);
         }
     }
 
-    fn reload_identity(&mut self) {
-        self.current_identity = identity::detect(&self.roots);
+    /// 完整刷新：先同步完成文件级刷新（界面立即更新），再在后台探测慢速
+    /// 项目（ZCode 进程状态、ZCode CLI 账号识别、各 CLI 会话探测）。
+    /// 点击后状态栏立即提示"正在刷新"，完成后结果回填并提示"已刷新"，
+    /// 期间界面保持响应、刷新按钮呈禁用态。
+    fn begin_refresh(&mut self, ctx: &egui::Context) {
+        if self.refreshing {
+            return;
+        }
+        self.refreshing = true;
+        self.refresh_seq += 1;
+        let tag = self.refresh_seq;
+        self.set_ok("正在刷新：读取账号列表、当前账号与 CLI 运行状态……");
+        self.refresh();
+
+        let shared = self.refresh_shared.clone();
+        let roots = self.roots.clone();
+        let context = ctx.clone();
+        std::thread::spawn(move || {
+            let zcode_running = crate::zcode_running();
+            let current_identity = crate::identity::detect(&roots);
+            let tools = TOOL_STORES
+                .iter()
+                .map(|store| ((store.detect)(&roots), store.cli_running()))
+                .collect();
+            *shared.lock().unwrap() = Some(RefreshOutcome {
+                tag,
+                zcode_running,
+                current_identity,
+                tools,
+            });
+            context.request_repaint();
+        });
+    }
+
+    /// 每帧取回已完成的后台刷新结果并应用到界面。
+    fn apply_refresh_outcome(&mut self) {
+        let Some(outcome) = self.refresh_shared.lock().unwrap().take() else {
+            return;
+        };
+        // 无论结果是否过期都复位刷新标记，避免界面永久停留在"刷新中"
+        self.refreshing = false;
+        if outcome.tag != self.refresh_seq {
+            return;
+        }
+        self.zcode_running
+            .store(outcome.zcode_running, Ordering::SeqCst);
+        self.current_identity = outcome.current_identity;
+        for (tool, (identity, cli_running)) in self.tools.iter_mut().zip(outcome.tools) {
+            tool.identity = identity;
+            tool.cli_running = cli_running;
+        }
+        // 启动后首次刷新：当前账号标识就绪时补齐默认备份名
+        if self.account_name.is_empty() {
+            if let Some(default_name) = self.current_identity.default_name() {
+                self.account_name = default_name;
+            }
+        }
+        for tool in self.tools.iter_mut() {
+            if tool.account_name.is_empty() {
+                if let Some(default_name) = tool.identity.default_name(tool.store.id_prefix) {
+                    tool.account_name = default_name;
+                }
+            }
+        }
+        self.set_ok("已刷新：账户列表与当前账号为最新状态");
     }
 
     /// 当前登录状态对应的既有备份（按凭据指纹匹配）。
@@ -301,25 +383,27 @@ impl ZCodeApp {
         }
     }
 
-    fn save_new(&mut self) {
+    fn save_new(&mut self, ctx: &egui::Context) {
         let name = self.pending_save_name();
         if zcode_running() {
             self.confirm = Some(ConfirmAction::Save { name });
             return;
         }
-        self.do_save(name);
+        self.do_save(name, ctx);
     }
 
-    fn do_save(&mut self, name: Option<String>) -> bool {
+    fn do_save(&mut self, name: Option<String>, ctx: &egui::Context) -> bool {
         match save_current_account(&self.roots, name.as_deref(), None) {
             Ok(profile) => {
                 self.account_name.clear();
-                self.reload_identity();
-                if let Some(default_name) = self.current_identity.default_name() {
-                    self.account_name = default_name;
-                }
-                self.set_ok(format!("已备份账户：{}", profile.manifest.display_name()));
                 self.refresh();
+                // 当前账号标识较慢（需调用 zcode CLI），放后台刷新；
+                // 完成后 apply_refresh_outcome 会补齐默认备份名
+                self.begin_refresh(ctx);
+                self.set_ok(format!(
+                    "已备份账户：{}；正在后台刷新当前账号标识……",
+                    profile.manifest.display_name()
+                ));
                 true
             }
             Err(error) => {
@@ -454,8 +538,12 @@ impl ZCodeApp {
                     match switch_account(&me.roots, &profile) {
                         Ok(()) => {
                             me.refresh();
-                            me.reload_identity();
-                            me.set_ok(format!("已切换到 {}", profile.manifest.display_name()));
+                            // 当前账号标识较慢（需调用 zcode CLI），放后台刷新
+                            me.begin_refresh(&ctx);
+                            me.set_ok(format!(
+                                "已切换到 {}；正在后台刷新当前账号标识……",
+                                profile.manifest.display_name()
+                            ));
                             true
                         }
                         Err(error) => {
@@ -466,7 +554,7 @@ impl ZCodeApp {
                 });
             }
             ConfirmAction::Save { name } => {
-                self.run_with_zcode_closed("保存", |me| me.do_save(name));
+                self.run_with_zcode_closed("保存", |me| me.do_save(name, &ctx));
             }
             ConfirmAction::Update(id) => {
                 self.run_with_zcode_closed("更新备份", |me| me.do_update(&id));
@@ -750,12 +838,18 @@ impl ZCodeApp {
                     && ui.input(|input| input.key_pressed(egui::Key::Enter))
                     && can_save)
             {
-                self.save_new();
+                self.save_new(ui.ctx());
             }
-            if ui.button("刷新").clicked() {
-                self.refresh();
-                self.reload_identity();
-                self.set_ok("已刷新账户列表与当前账号");
+            let refresh_label = if self.refreshing { "刷新中…" } else { "刷新" };
+            if ui
+                .add_enabled(
+                    !self.refreshing,
+                    egui::Button::new(refresh_label),
+                )
+                .on_hover_text("立即更新账号列表；当前账号与运行状态在后台探测，完成后自动更新显示")
+                .clicked()
+            {
+                self.begin_refresh(ui.ctx());
             }
             if ui.button("打开备份目录").clicked() {
                 match open_accounts_folder(&self.roots) {
@@ -949,9 +1043,13 @@ impl ZCodeApp {
                 let name = self.tools[tool_index].pending_save_name();
                 self.do_tool_save(tool_index, name);
             }
-            if ui.button("刷新").clicked() {
-                self.refresh();
-                self.set_ok("已刷新 CLI 账号列表与当前账号");
+            let refresh_label = if self.refreshing { "刷新中…" } else { "刷新" };
+            if ui
+                .add_enabled(!self.refreshing, egui::Button::new(refresh_label))
+                .on_hover_text("立即更新账号列表；CLI 会话探测在后台进行，完成后自动更新显示")
+                .clicked()
+            {
+                self.begin_refresh(ui.ctx());
             }
             if ui.button("打开备份目录").clicked() {
                 match store.open_accounts_folder(&self.roots) {
@@ -1683,6 +1781,8 @@ fn spawn_send_worker(
 impl eframe::App for ZCodeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // 后台慢速刷新完成时取回结果，保证展示的账号状态为最新
+        self.apply_refresh_outcome();
         // 点击窗口关闭按钮 = 隐藏到系统托盘；仅托盘菜单「退出」会真正退出
         if ctx.input(|input| input.viewport().close_requested())
             && !tray::EXIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
