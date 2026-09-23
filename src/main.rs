@@ -20,12 +20,16 @@ mod accounts;
 mod auto_send;
 mod claude;
 mod cli_accounts;
+mod clipboard;
+mod codebuddy;
 mod codex;
 mod gemini;
 mod gui;
 mod identity;
 mod single_instance;
+mod transfer;
 mod tray;
+mod web;
 
 #[derive(Clone, Copy)]
 enum Root {
@@ -192,13 +196,34 @@ struct CleanOptions {
     no_backup: bool,
     backup_dir: Option<PathBuf>,
 }
+
+/// export / import 子命令的参数。
+#[derive(Default)]
+struct TransferArgs {
+    /// zcode | gemini | codex | claude | codebuddy
+    tool: String,
+    /// export：要导出的账号 id，空 = 全部
+    ids: Vec<String>,
+    /// export：输出路径，None = 当前目录下默认文件名
+    out: Option<PathBuf>,
+    /// import：导入文件路径
+    file: Option<PathBuf>,
+}
+
 enum Action {
-    Gui { start_hidden: bool },
+    Gui {
+        start_hidden: bool,
+    },
+    Web {
+        port: u16,
+    },
     InteractiveCli,
     Inspect,
     Whoami,
     Backup(Option<PathBuf>),
     Clean(CleanOptions),
+    Export(TransferArgs),
+    Import(TransferArgs),
     AutoSend {
         pinned: usize,
         message: String,
@@ -240,7 +265,9 @@ fn tr(zh: &str, en: &str) -> String {
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Action, String> {
     let mut args = args.into_iter();
     let Some(action) = args.next() else {
-        return Ok(Action::Gui { start_hidden: false });
+        return Ok(Action::Gui {
+            start_hidden: false,
+        });
     };
     if ["--help", "-h"].contains(&action.as_str()) {
         return Ok(Action::Help);
@@ -255,16 +282,42 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Action, String> 
         // 随桌面自启动时使用：启动后隐藏到系统托盘
         return Ok(Action::Gui { start_hidden: true });
     }
+    let mut web_port: u16 = env::var("ZCODE_WEB_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(web::DEFAULT_WEB_PORT);
     let mut options = CleanOptions::default();
     let mut auto_send = AutoSendArgs::default();
+    let mut transfer = TransferArgs::default();
+    let is_transfer = action == "export" || action == "import";
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--port" | "-p" if action == "web" || action == "--web" => {
+                let value = args.next().ok_or("--port 缺少端口参数")?;
+                web_port = value.parse().map_err(|_| "--port 需要 1-65535 的端口号")?;
+            }
             "--safe" if action == "clean" => options.safe = true,
             "--no-backup" if action == "clean" => options.no_backup = true,
             "--backup-dir" if action == "clean" || action == "backup" => {
                 options.backup_dir = Some(PathBuf::from(
                     args.next().ok_or("--backup-dir 缺少目录参数")?,
                 ));
+            }
+            "--tool" if is_transfer => {
+                transfer.tool = args
+                    .next()
+                    .ok_or("--tool 缺少工具参数 (zcode|gemini|codex|claude|codebuddy)")?;
+            }
+            "--id" if action == "export" => {
+                transfer
+                    .ids
+                    .push(args.next().ok_or("--id 缺少账号 id 参数")?);
+            }
+            "--out" | "-o" if action == "export" => {
+                transfer.out = Some(PathBuf::from(args.next().ok_or("--out 缺少路径参数")?));
+            }
+            "--file" | "-f" if action == "import" => {
+                transfer.file = Some(PathBuf::from(args.next().ok_or("--file 缺少路径参数")?));
             }
             "--pinned" if action == "send" => {
                 let value = args.next().ok_or("--pinned 缺少序号参数")?;
@@ -282,11 +335,27 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Action, String> 
         }
     }
     match action.as_str() {
+        "web" | "--web" => Ok(Action::Web { port: web_port }),
         "interactive" => Ok(Action::InteractiveCli),
         "inspect" => Ok(Action::Inspect),
         "--whoami" => Ok(Action::Whoami),
         "backup" => Ok(Action::Backup(options.backup_dir)),
         "clean" => Ok(Action::Clean(options)),
+        "export" => {
+            if transfer.tool.is_empty() {
+                return Err("export 命令需要 --tool 指定工具 (zcode|gemini|codex|claude|codebuddy)".into());
+            }
+            Ok(Action::Export(transfer))
+        }
+        "import" => {
+            if transfer.tool.is_empty() {
+                return Err("import 命令需要 --tool 指定工具 (zcode|gemini|codex|claude|codebuddy)".into());
+            }
+            if transfer.file.is_none() {
+                return Err("import 命令需要 --file 指定导入文件路径".into());
+            }
+            Ok(Action::Import(transfer))
+        }
         "send" => {
             if auto_send.pinned == 0 {
                 return Err("send 命令需要 --pinned 提供置顶会话序号".into());
@@ -369,7 +438,11 @@ fn detect_zcode_desktop_exe() -> Option<PathBuf> {
         .output()
         .ok()?;
     let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    if path.is_file() { Some(path) } else { None }
+    if path.is_file() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 /// 在结束 ZCode 之前调用，否则进程关闭后就无从得知桌面端装在哪里。
@@ -519,9 +592,7 @@ fn install_update(update: &UpdateManifest) -> Result<(), String> {
             .stderr(std::process::Stdio::null());
         use std::os::unix::process::CommandExt;
         let _ = command.process_group(0);
-        command
-            .spawn()
-            .map_err(|error| error.to_string())?;
+        command.spawn().map_err(|error| error.to_string())?;
     }
     println!(
         "{}",
@@ -541,13 +612,19 @@ fn terminate_zcode() -> Result<(), String> {
         .args(["/F", "/T", "/IM", "ZCode.exe"])
         .output();
     #[cfg(not(windows))]
-    let result = Command::new("pkill")
-        .args(["-TERM", "-x", DESKTOP_PROCESS_NAME])
-        .output();
+    let result = {
+        let _ = Command::new("pkill")
+            .args(["-TERM", "-f", "zcodeOfficial/zcode"])
+            .output();
+        Command::new("pkill")
+            .args(["-TERM", "-x", DESKTOP_PROCESS_NAME])
+            .output()
+    };
     match result {
         Ok(output) if output.status.success() || !zcode_running() => {
             for _ in 0..10 {
                 if !zcode_running() {
+                    thread::sleep(Duration::from_millis(200));
                     println!("[完成] ZCode 进程已结束。");
                     return Ok(());
                 }
@@ -556,10 +633,14 @@ fn terminate_zcode() -> Result<(), String> {
             #[cfg(not(windows))]
             {
                 let _ = Command::new("pkill")
+                    .args(["-KILL", "-f", "zcodeOfficial/zcode"])
+                    .output();
+                let _ = Command::new("pkill")
                     .args(["-KILL", "-x", DESKTOP_PROCESS_NAME])
                     .output();
                 for _ in 0..6 {
                     if !zcode_running() {
+                        thread::sleep(Duration::from_millis(200));
                         println!("[完成] ZCode 进程已结束。");
                         return Ok(());
                     }
@@ -1041,7 +1122,70 @@ fn interactive() -> Result<(), String> {
 
 fn print_help(program: &OsStr) {
     let exe = Path::new(program).display();
-    println!("ZCode Account Manager {}\n\nUsage / 用法:\n  {exe}\n  {exe} interactive\n  {exe} inspect\n  {exe} --whoami\n  {exe} backup [--backup-dir DIR]\n  {exe} clean [--safe] [--no-backup] [--backup-dir DIR]\n  {exe} send --pinned N --message \"...\" [--dry-run] [--at HH:MM] [--daily]  (Linux X11)\n  {exe} --check-update\n\nLanguage / 语言: set ZCODE_LANG=en or zh", env!("CARGO_PKG_VERSION"));
+    println!("ZCode Account Manager {}\n\nUsage / 用法:\n  {exe}\n  {exe} web [--port PORT]                                             (Web 管理端)\n  {exe} interactive\n  {exe} inspect\n  {exe} --whoami\n  {exe} backup [--backup-dir DIR]\n  {exe} clean [--safe] [--no-backup] [--backup-dir DIR]\n  {exe} export --tool zcode|gemini|codex|claude|codebuddy [--id ID]... [--out FILE]\n  {exe} import --tool zcode|gemini|codex|claude|codebuddy --file FILE\n  {exe} send --pinned N --message \"...\" [--dry-run] [--at HH:MM] [--daily]  (Linux X11)\n  {exe} --check-update\n\nLanguage / 语言: set ZCODE_LANG=en or zh", env!("CARGO_PKG_VERSION"));
+}
+
+/// export / import 子命令共用的工具定位。
+fn transfer_tool_store(tool: &str) -> Result<Option<&'static cli_accounts::ToolStore>, String> {
+    let store = match tool {
+        "gemini" => Some(&gemini::STORE),
+        "codex" => Some(&codex::STORE),
+        "claude" => Some(&claude::STORE),
+        "codebuddy" => Some(&codebuddy::STORE),
+        "zcode" => None,
+        other => {
+            return Err(format!(
+                "未知工具 {other}；支持 zcode|gemini|codex|claude|codebuddy"
+            ))
+        }
+    };
+    Ok(store)
+}
+
+/// 导出账号备份为单个移植 JSON 文件（含登录凭据，请妥善保管）。
+fn run_export(args: TransferArgs) -> Result<(), String> {
+    let roots = Roots::detect()?;
+    let store = transfer_tool_store(&args.tool)?;
+    let json = match store {
+        Some(store) => transfer::export_tool_accounts(store, &roots, &args.ids)?,
+        None => transfer::export_zcode_accounts(&roots, &args.ids)?,
+    };
+    let path = args.out.unwrap_or_else(|| transfer::default_file_name(&args.tool).into());
+    fs::write(&path, json.as_bytes())
+        .map_err(|error| format!("写入导出文件 {} 失败: {error}", path.display()))?;
+    let count = serde_json::from_str::<serde_json::Value>(&json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("accounts")
+                .and_then(|accounts| accounts.as_array())
+                .map(|accounts| accounts.len())
+        })
+        .unwrap_or(0);
+    println!("[导出] 已导出 {count} 个账号 -> {}", path.display());
+    println!("[导出] 提示：导出文件包含登录凭据，请像密码一样保管，不要上传或分享。");
+    Ok(())
+}
+
+/// 从移植文件（或各工具原生格式 JSON）导入账号，只创建备份不切换账号。
+fn run_import(args: TransferArgs) -> Result<(), String> {
+    let roots = Roots::detect()?;
+    let path = args
+        .file
+        .ok_or_else(|| "import 命令需要 --file 指定导入文件路径".to_string())?;
+    let store = transfer_tool_store(&args.tool)?;
+    let display = store
+        .map(|store| store.display)
+        .unwrap_or("ZCode 主程序");
+    let result = match store {
+        Some(store) => transfer::import_tool_file(store, &roots, &path)?,
+        None => transfer::import_zcode_file(&roots, &path)?,
+    };
+    println!(
+        "[导入] {display} 导入完成：成功 {} 个，跳过 {} 个。可在账号列表中切换使用。",
+        result.imported, result.skipped
+    );
+    Ok(())
 }
 
 fn format_wait(seconds: u64) -> String {
@@ -1066,7 +1210,25 @@ fn run() -> Result<(), String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     match parse_args(args)? {
-        Action::Gui { start_hidden } => gui::launch(start_hidden)?,
+        Action::Gui { start_hidden } => {
+            // 以独立子进程启动 Web 管理端，独立进程组，使其不受 GUI 崩溃/退出影响。
+            let exe = env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from(&program));
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.arg("web")
+                .arg("--port")
+                .arg(crate::web::DEFAULT_WEB_PORT.to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let _ = cmd.process_group(0);
+            }
+            let _ = cmd.spawn();
+            gui::launch(start_hidden)?
+        }
+        Action::Web { port } => web::run_server(port)?,
         Action::InteractiveCli => interactive()?,
         Action::Help => print_help(&program),
         Action::Version => println!("zcode-account-manager {}", env!("CARGO_PKG_VERSION")),
@@ -1083,7 +1245,11 @@ fn run() -> Result<(), String> {
                     .unwrap_or_else(|| "（未检测到登录状态）".into())
             );
             for store in [&gemini::STORE, &codex::STORE, &claude::STORE] {
-                println!("{} 账号: {}", store.display, store.identity(&roots).describe());
+                println!(
+                    "{} 账号: {}",
+                    store.display,
+                    store.identity(&roots).describe()
+                );
             }
             if zcode_running() {
                 println!("ZCode 桌面客户端: 运行中");
@@ -1098,6 +1264,8 @@ fn run() -> Result<(), String> {
             backup(&roots, &root).map_err(|e| e.to_string())?;
         }
         Action::Clean(options) => clean(&Roots::detect()?, options)?,
+        Action::Export(args) => run_export(args)?,
+        Action::Import(args) => run_import(args)?,
         Action::AutoSend {
             pinned,
             message,
@@ -1109,9 +1277,16 @@ fn run() -> Result<(), String> {
             if let Some(at_time) = &at {
                 let wait = auto_send::seconds_until(at_time, daily)?;
                 if daily {
-                    println!("[定时] 将在每天 {} 自动发送（首次 {} 后），Ctrl+C 取消。", at_time, format_wait(wait));
+                    println!(
+                        "[定时] 将在每天 {} 自动发送（首次 {} 后），Ctrl+C 取消。",
+                        at_time,
+                        format_wait(wait)
+                    );
                 } else {
-                    println!("[定时] 将在 {} 后自动发送，Ctrl+C 取消。", format_wait(wait));
+                    println!(
+                        "[定时] 将在 {} 后自动发送，Ctrl+C 取消。",
+                        format_wait(wait)
+                    );
                 }
                 let mut remaining = wait;
                 while remaining > 0 {
@@ -1200,7 +1375,9 @@ mod tests {
     fn no_arguments_enters_gui_mode() {
         assert!(matches!(
             parse_args(Vec::new()).unwrap(),
-            Action::Gui { start_hidden: false }
+            Action::Gui {
+                start_hidden: false
+            }
         ));
         assert!(matches!(
             parse_args(vec!["--hidden".to_string()]).unwrap(),
@@ -1234,5 +1411,17 @@ mod tests {
         assert!(roots
             .resolve(CANDIDATES[0])
             .ends_with(Path::new(".zcode").join("v2").join("credentials.json")));
+    }
+
+    #[test]
+    fn parses_web_action() {
+        match parse_args(["web".to_string()]).unwrap() {
+            Action::Web { port } => assert_eq!(port, web::DEFAULT_WEB_PORT),
+            _ => panic!("unexpected action"),
+        }
+        match parse_args(["web".to_string(), "--port".to_string(), "9090".to_string()]).unwrap() {
+            Action::Web { port } => assert_eq!(port, 9090),
+            _ => panic!("unexpected action"),
+        }
     }
 }

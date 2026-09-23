@@ -40,14 +40,15 @@
 
 ---
 
-## CLI 账号管理（Gemini / Codex / Claude Code）
+## CLI 账号管理（Gemini / Codex / Claude Code / CodeBuddy CLI）
 
-「CLI 账号」页为三个主流 AI 编程 CLI 提供统一的多账号体验：**Google Gemini CLI / Antigravity CLI（`agy`）**、**OpenAI Codex CLI** 和 **Anthropic Claude Code**。每个工具一个标签页，操作方式完全一致：
+「CLI 账号」页为四个主流 AI 编程 CLI 提供统一的多账号体验：**Google Gemini CLI / Antigravity CLI（`agy`）**、**OpenAI Codex CLI**、**Anthropic Claude Code** 和 **CodeBuddy CLI**。每个工具一个标签页，操作方式完全一致，并且所有账号类型（含 ZCode 主账号）都支持导入导出与跨机器迁移：
 
 1. 用 CLI 登录一个账号后，在对应标签页工具会自动识别当前账号（邮箱 / 认证方式 / 凭据指纹）并显示在「当前账号」栏。
 2. 点击 **保存当前账号** 创建备份；名称留空时自动用邮箱前缀或指纹前缀命名，也可填一个好记的**别名**。
 3. 登录其他账号并分别保存，之后随时在列表中点击 **切换**：切换前当前状态会自动备份到原账号，目标恢复失败时自动回滚。
 4. 点击 **清空账号** 可一键退出登录：先自动备份当前登录状态，再清除凭据文件，恢复到未登录的原始状态，方便换一个账号重新登录。清空产生的备份保留在列表里，随时可以切换回来。
+5. 列表每行的 **导出** 与工具栏的 **导入账号 / 导出全部** 用于跨电脑迁移账号（详见下方「账号导入导出」）。
 
 各工具的快照内容与备份位置（备份统一放在各自目录下的 `account_backups/`）：
 
@@ -82,6 +83,58 @@
 | **设置** | `settings.json` | 用户设置，含 `env` 中的 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` 自定义端点认证——替换该文件即可在中转 / 第三方端点账号之间切换；快照缺失时保留本机现状 |
 
 > 端点账号识别：Claude Code 通过 settings 中的 Token + `ANTHROPIC_BASE_URL` 识别（如 `API 端点 open.bigmodel.cn`），Token 或端点不同即视为不同账号。
+
+**CodeBuddy CLI**（`~/.codebuddy/account_backups/`）：
+
+| 快照项 | 路径（`~/.codebuddy/` 下） | 说明 |
+| :--- | :--- | :--- |
+| **设置与认证** | `settings.json` | 保存 `env.CODEBUDDY_AUTH_TOKEN` 及 `CODEBUDDY_INTERNET_ENVIRONMENT`；Token 或站点环境不同即视为不同账号 |
+
+### 账号导入导出（所有账号类型）
+
+「账户」页和每个 CLI 工具页都支持**导入 / 导出**，方便把账号备份迁移到另一台电脑：
+
+- **导出**：列表每行的「导出」按钮导出单个账号，「导出全部」导出该工具的全部备份。导出产物是**单个 JSON 移植文件**（内嵌 base64 文件内容，默认名 `zam-<工具>-accounts.json`）。CLI 工具的移植文件很小，还可以**一键复制到剪贴板**；ZCode 主账号快照包含大量文件（会话、本地存储等），只提供保存到文件。
+- **导入**：选择移植文件即可在另一台电脑还原备份；导入只创建备份，**不切换当前登录状态**，之后在列表中按需切换。CLI 工具页同时支持**从剪贴板粘贴**导入。ZCode 快照文件多体积大，仅支持文件导入。
+
+除移植文件外，各 CLI 工具还接受「原生格式」JSON 直接导入（从另一台机器复制对应文件即可）：
+
+| 工具 | 原生格式 |
+| :--- | :--- |
+| **Gemini / Antigravity** | `oauth_creds.json`（顶层 `refresh_token`）、`antigravity-oauth-token`（嵌套 `token.refresh_token`） |
+| **Codex** | `auth.json`（ChatGPT OAuth `tokens` 或 `OPENAI_API_KEY`） |
+| **Claude Code** | `settings.json`（`env` 端点 Token）、`.credentials.json`（`claudeAiOauth`） |
+| **CodeBuddy** | WorkBuddy / wb-switch 导出的 JSON 账号数组、单个 `settings.json` |
+
+导入内容与目标工具不匹配时会明确提示该文件属于哪个工具，请到对应页签导入。命令行同样可用：
+
+```bash
+zcode-account-manager export --tool codex --out codex-accounts.json   # --id 可指定账号，缺省全部
+zcode-account-manager import --tool codex --file codex-accounts.json  # 工具：zcode|gemini|codex|claude|codebuddy
+```
+
+> ⚠️ 导出文件与剪贴板内容包含完整登录凭据，请像密码一样保管，不要上传或分享；也不要导入来路不明的文件。
+
+### CodeBuddy 批量导入
+
+CodeBuddy 标签页支持从 **WorkBuddy / wb-switch 导出的 JSON 账号数组**导入，也可粘贴或选择一个 `~/.codebuddy/settings.json`。导入只创建独立备份，不切换当前登录状态；之后可在列表中按需切换。
+
+```json
+[
+  {
+    "email": "user@example.com",
+    "variant": "ai",
+    "env": {
+      "CODEBUDDY_AUTH_TOKEN": "TOKEN",
+      "CODEBUDDY_INTERNET_ENVIRONMENT": "public"
+    }
+  }
+]
+```
+
+- 单个 `settings.json` 对象：`env.CODEBUDDY_AUTH_TOKEN` 支持裸 Token 或 `Bearer TOKEN`。
+- 数组记录缺少 Token 时会跳过，其他有效记录继续导入；导入结果显示成功与跳过数量。
+- 导入文件中的 `variant` / `CODEBUDDY_INTERNET_ENVIRONMENT` 用于区分国际版和国内版；其他配置项和 helper 命令会被忽略，避免导入时覆盖本机设置。
 
 > ⚠️ 切换前请退出对应 CLI 正在运行的会话：运行中的会话可能在切换后把旧登录凭据回写覆盖。工具检测到相关 CLI 运行时会在界面上给出提示；切换完成后重启会话即可使用新账号。
 
@@ -131,7 +184,7 @@
 
 发布文件 `zcode-account-manager.exe` 不需要 Python 或其他运行时。
 
-直接双击 EXE 会打开 **ZCode 账户管家**。账户页用于备份、更新、切换和删除 ZCode 账户快照；「CLI 账号」页为 Gemini / Antigravity、Codex、Claude Code 三个 CLI 提供同样的多账号备份与切换；清理页提供安全清理和完整重置；「自动发送」页可以向 ZCode 桌面端的指定会话自动发送消息。所有会改动本地状态的操作都有明确状态反馈和二次确认。
+直接双击 EXE 会打开 **ZCode 账户管家**。账户页用于备份、更新、切换和删除 ZCode 账户快照；「CLI 账号」页为 Gemini / Antigravity、Codex、Claude Code、CodeBuddy 四个 CLI 提供同样的多账号备份与切换；清理页提供安全清理和完整重置；「自动发送」页可以向 ZCode 桌面端的指定会话自动发送消息。所有会改动本地状态的操作都有明确状态反馈和二次确认。
 
 ## 自动发送消息（Linux X11）
 

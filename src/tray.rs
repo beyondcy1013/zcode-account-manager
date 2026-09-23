@@ -33,11 +33,11 @@ mod imp {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-        DispatchMessageW, DestroyMenu, GetMessageW, GetCursorPos, PostMessageW, PostQuitMessage,
+        DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, PostMessageW, PostQuitMessage,
         RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu,
         TranslateMessage, HWND_MESSAGE, ICONINFO, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_RETURNCMD,
-        TPM_RIGHTBUTTON, WNDCLASSW, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
-        WM_RBUTTONUP,
+        TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
+        WNDCLASSW,
     };
 
     const TRAY_ID: u32 = 1;
@@ -252,7 +252,12 @@ mod imp {
             return;
         }
         unsafe {
-            AppendMenuW(menu, MF_STRING, MENU_OPEN as usize, wide("打开主窗口").as_ptr());
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                MENU_OPEN as usize,
+                wide("打开主窗口").as_ptr(),
+            );
             AppendMenuW(menu, MF_STRING, MENU_EXIT as usize, wide("退出").as_ptr());
         }
         // TrackPopupMenu 前必须把菜单窗口设为前台，否则点击菜单外不会关闭菜单
@@ -309,7 +314,11 @@ mod imp {
 mod imp {
     use eframe::egui;
     use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ClientMessageEvent, ClientMessageData, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, ImageFormat, Pixmap, PropMode, Window, WindowClass};
+    use x11rb::protocol::xproto::{
+        ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent, ConnectionExt,
+        CreateGCAux, CreateWindowAux, EventMask, ImageFormat, Pixmap, PropMode, Window,
+        WindowClass,
+    };
     use x11rb::rust_connection::RustConnection;
 
     /// XEmbed 托盘线程；面板的托盘区未提供 StatusNotifier watcher，但保留了
@@ -358,7 +367,9 @@ mod imp {
         let window: Window = conn.generate_id().map_err(xerr)?;
         let aux = CreateWindowAux::new()
             .background_pixel(screen.black_pixel)
-            .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::STRUCTURE_NOTIFY);
+            .event_mask(
+                EventMask::EXPOSURE | EventMask::BUTTON_PRESS | EventMask::STRUCTURE_NOTIFY,
+            );
         conn.create_window(
             screen.root_depth,
             window,
@@ -406,7 +417,8 @@ mod imp {
 
         // 事件循环：尺寸变化时重绘图标，点击时唤起主窗口
         let gc: u32 = conn.generate_id().map_err(xerr)?;
-        conn.create_gc(gc, window, &CreateGCAux::new()).map_err(xerr)?;
+        conn.create_gc(gc, window, &CreateGCAux::new())
+            .map_err(xerr)?;
         let mut current_size = 0u32;
         loop {
             let event = conn.wait_for_event().map_err(xerr)?;
@@ -415,8 +427,17 @@ mod imp {
                     let size = ev.width.min(ev.height) as u32;
                     if size > 0 && size != current_size {
                         current_size = size;
-                        draw_icon(&conn, screen.root_depth, window, gc, &icon, icon_w, icon_h, size)
-                            .map_err(xerr)?;
+                        draw_icon(
+                            &conn,
+                            screen.root_depth,
+                            window,
+                            gc,
+                            &icon,
+                            icon_w,
+                            icon_h,
+                            size,
+                        )
+                        .map_err(xerr)?;
                     }
                 }
                 x11rb::protocol::Event::ButtonPress(ev) if ev.event == window => {
@@ -472,11 +493,15 @@ mod imp {
             &pixels,
         )
         .map_err(|error| error.to_string())?;
-        conn.change_window_attributes(window, &ChangeWindowAttributesAux::new().background_pixmap(pixmap))
-            .map_err(|error| error.to_string())?;
+        conn.change_window_attributes(
+            window,
+            &ChangeWindowAttributesAux::new().background_pixmap(pixmap),
+        )
+        .map_err(|error| error.to_string())?;
         conn.clear_area(false, window, 0, 0, size as u16, size as u16)
             .map_err(|error| error.to_string())?;
-        conn.free_pixmap(pixmap).map_err(|error| error.to_string())?;
+        conn.free_pixmap(pixmap)
+            .map_err(|error| error.to_string())?;
         conn.flush().map_err(|error| error.to_string())?;
         Ok(())
     }

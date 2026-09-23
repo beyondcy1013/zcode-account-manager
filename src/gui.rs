@@ -4,8 +4,9 @@ use crate::{
         set_alias, set_phone, switch_account, AccountProfile,
     },
     auto_send::{self, AutoSendRequest, SendSteps},
-    clean, claude, cli_accounts, codex, gemini, launch_zcode, single_instance, terminate_zcode,
-    tray, zcode_running, CleanOptions, Roots,
+    candidate_by_tag, claude, clean, cli_accounts, clipboard, codebuddy, codex, gemini,
+    launch_zcode, single_instance, terminate_zcode, transfer, tray, zcode_running, CleanOptions,
+    Roots, FULL_TAGS,
 };
 use eframe::egui::{self, Color32, RichText};
 use std::{
@@ -23,18 +24,27 @@ use crate::identity::AccountIdentity;
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Accounts,
-    ToolAccounts,
+    GeminiAccounts,
+    CodexAccounts,
+    ClaudeAccounts,
+    CodeBuddyAccounts,
     Cleanup,
     AutoSend,
 }
 
 /// CLI 工具账号页展示的工具顺序。
-const TOOL_STORES: [&'static cli_accounts::ToolStore; 3] =
-    [&gemini::STORE, &codex::STORE, &claude::STORE];
+const TOOL_STORES: [&cli_accounts::ToolStore; 4] = [
+    &gemini::STORE,
+    &codex::STORE,
+    &claude::STORE,
+    &codebuddy::STORE,
+];
 
 enum ConfirmAction {
     Switch(String),
-    Save { name: Option<String> },
+    Save {
+        name: Option<String>,
+    },
     Update(String),
     Delete(String),
     /// 按 TOOL_STORES 下标定位工具。
@@ -59,10 +69,42 @@ struct AccountEditor {
     phone: String,
 }
 
+/// Gemini / Antigravity 登录窗口状态。
+#[derive(Default)]
+struct GeminiLoginState {
+    auth_code: String,
+    submitting: bool,
+    error: Option<String>,
+}
+
 /// CLI 工具账号编辑窗口的状态：仅别名。
 struct ToolEditor {
     id: String,
     alias: String,
+}
+
+/// 导入导出的目标：ZCode 主账号页或某个 CLI 工具页（按 TOOL_STORES 下标）。
+#[derive(Clone, Copy, PartialEq)]
+enum TransferTarget {
+    ZCode,
+    Tool(usize),
+}
+
+/// 导入窗口状态：文件路径与粘贴文本二选一。
+struct TransferImportState {
+    target: TransferTarget,
+    path: String,
+    text: String,
+}
+
+/// 导出窗口状态：打开时即生成移植文件内容。
+struct TransferExportState {
+    target: TransferTarget,
+    /// None = 导出全部账号。
+    account_id: Option<String>,
+    json: String,
+    error: Option<String>,
+    save_path: String,
 }
 
 /// 后台慢速刷新的结果（进程探测、ZCode CLI 账号识别、CLI 会话探测），
@@ -82,6 +124,8 @@ struct ToolAccounts {
     accounts: Vec<AccountProfile>,
     active_id: Option<String>,
     identity: cli_accounts::CliIdentity,
+    /// 记录最近一次据以填充默认名称的账号标识；账号未变时保留用户手动修改，仅当检测到新账号才自动覆盖更新。
+    last_detected_identity: Option<cli_accounts::CliIdentity>,
     account_name: String,
     editor: Option<ToolEditor>,
     /// 是否检测到正在运行的 CLI 会话（刷新时更新，不逐帧探测）。
@@ -95,9 +139,27 @@ impl ToolAccounts {
             accounts: Vec::new(),
             active_id: None,
             identity: cli_accounts::CliIdentity::default(),
+            last_detected_identity: None,
             account_name: String::new(),
             editor: None,
             cli_running: false,
+        }
+    }
+
+    /// 当检测到新账号时动态更新账户名称；若账号未变，则保留用户手动修改的内容。
+    fn sync_account_name_on_identity_change(&mut self) {
+        if !self.identity.is_present() {
+            if self.last_detected_identity.is_some() {
+                self.last_detected_identity = None;
+                self.account_name.clear();
+            }
+            return;
+        }
+        if self.last_detected_identity.as_ref() != Some(&self.identity) {
+            if let Some(default_name) = self.identity.default_name(self.store.id_prefix) {
+                self.account_name = default_name;
+            }
+            self.last_detected_identity = Some(self.identity.clone());
         }
     }
 
@@ -142,6 +204,8 @@ pub struct ZCodeApp {
     accounts: Vec<AccountProfile>,
     active_id: Option<String>,
     current_identity: AccountIdentity,
+    /// 记录最近一次据以填充默认名称的账号标识；账号未变时保留用户手动修改，仅当检测到新账号才自动覆盖更新。
+    last_detected_identity: Option<AccountIdentity>,
     account_name: String,
     auto_restart: bool,
     info_editor: Option<AccountEditor>,
@@ -161,7 +225,7 @@ pub struct ZCodeApp {
     schedule_time: String,
     schedule_daily: bool,
     schedule_cancel: Arc<Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>>,
-    /// CLI 工具（Gemini / Codex / Claude）账号状态，与 TOOL_STORES 顺序一致。
+    /// CLI 工具（Gemini / Codex / Claude / CodeBuddy）账号状态，与 TOOL_STORES 顺序一致。
     tools: Vec<ToolAccounts>,
     /// CLI 账号页当前选中的工具下标。
     tool_page: usize,
@@ -172,6 +236,11 @@ pub struct ZCodeApp {
     refresh_shared: Arc<Mutex<Option<RefreshOutcome>>>,
     refresh_seq: u64,
     refreshing: bool,
+    gemini_login: Option<GeminiLoginState>,
+    /// 账号导入窗口（所有账号类型共用）。
+    transfer_import: Option<TransferImportState>,
+    /// 账号导出窗口（所有账号类型共用）。
+    transfer_export: Option<TransferExportState>,
 }
 
 impl ZCodeApp {
@@ -199,6 +268,7 @@ impl ZCodeApp {
             active_id: None,
             // 当前账号标识由启动后的首次后台刷新填充，避免窗口出现前卡顿数秒
             current_identity: AccountIdentity::default(),
+            last_detected_identity: None,
             account_name: String::new(),
             auto_restart: true,
             info_editor: None,
@@ -225,20 +295,11 @@ impl ZCodeApp {
             refresh_shared: Arc::new(Mutex::new(None)),
             refresh_seq: 0,
             refreshing: false,
+            gemini_login: None,
+            transfer_import: None,
+            transfer_export: None,
         };
         app.refresh();
-        if app.account_name.is_empty() {
-            if let Some(default_name) = app.current_identity.default_name() {
-                app.account_name = default_name;
-            }
-        }
-        for tool in app.tools.iter_mut() {
-            if tool.account_name.is_empty() {
-                if let Some(default_name) = tool.identity.default_name(tool.store.id_prefix) {
-                    tool.account_name = default_name;
-                }
-            }
-        }
         // 启动后立即后台补齐慢速信息（ZCode 进程状态、当前账号标识）
         app.begin_refresh(&cc.egui_ctx);
         // 后台轮询 ZCode 运行状态，界面帧只读缓存值
@@ -275,9 +336,27 @@ impl ZCodeApp {
             }
             // 工具账号识别只读本地文件，代价低，随列表一起刷新
             tool.identity = (store.detect)(&self.roots);
+            tool.sync_account_name_on_identity_change();
         }
         for error in errors {
             self.set_error(error);
+        }
+    }
+
+    /// 当检测到新账号时动态更新账户名称；若账号未变，则保留用户手动修改的内容。
+    fn sync_account_name_on_identity_change(&mut self) {
+        if !self.current_identity.is_present() {
+            if self.last_detected_identity.is_some() {
+                self.last_detected_identity = None;
+                self.account_name.clear();
+            }
+            return;
+        }
+        if self.last_detected_identity.as_ref() != Some(&self.current_identity) {
+            if let Some(default_name) = self.current_identity.default_name() {
+                self.account_name = default_name;
+            }
+            self.last_detected_identity = Some(self.current_identity.clone());
         }
     }
 
@@ -328,22 +407,11 @@ impl ZCodeApp {
         self.zcode_running
             .store(outcome.zcode_running, Ordering::SeqCst);
         self.current_identity = outcome.current_identity;
+        self.sync_account_name_on_identity_change();
         for (tool, (identity, cli_running)) in self.tools.iter_mut().zip(outcome.tools) {
             tool.identity = identity;
             tool.cli_running = cli_running;
-        }
-        // 启动后首次刷新：当前账号标识就绪时补齐默认备份名
-        if self.account_name.is_empty() {
-            if let Some(default_name) = self.current_identity.default_name() {
-                self.account_name = default_name;
-            }
-        }
-        for tool in self.tools.iter_mut() {
-            if tool.account_name.is_empty() {
-                if let Some(default_name) = tool.identity.default_name(tool.store.id_prefix) {
-                    tool.account_name = default_name;
-                }
-            }
+            tool.sync_account_name_on_identity_change();
         }
         self.set_ok("已刷新：账户列表与当前账号为最新状态");
     }
@@ -395,10 +463,13 @@ impl ZCodeApp {
     fn do_save(&mut self, name: Option<String>, ctx: &egui::Context) -> bool {
         match save_current_account(&self.roots, name.as_deref(), None) {
             Ok(profile) => {
-                self.account_name.clear();
+                if let Some(default_name) = self.current_identity.default_name() {
+                    self.account_name = default_name;
+                } else {
+                    self.account_name.clear();
+                }
                 self.refresh();
-                // 当前账号标识较慢（需调用 zcode CLI），放后台刷新；
-                // 完成后 apply_refresh_outcome 会补齐默认备份名
+                // 当前账号标识较慢（需调用 zcode CLI），放后台刷新
                 self.begin_refresh(ctx);
                 self.set_ok(format!(
                     "已备份账户：{}；正在后台刷新当前账号标识……",
@@ -452,11 +523,12 @@ impl ZCodeApp {
         };
         match store.save_current_account(&self.roots, name.as_deref(), None) {
             Ok(profile) => {
-                self.tools[tool_index].account_name.clear();
                 self.refresh();
-                let tool = &self.tools[tool_index];
+                let tool = &mut self.tools[tool_index];
                 if let Some(default_name) = tool.identity.default_name(store.id_prefix) {
-                    self.tools[tool_index].account_name = default_name;
+                    tool.account_name = default_name;
+                } else {
+                    tool.account_name.clear();
                 }
                 self.set_ok(format!(
                     "已备份 {} 账号：{}",
@@ -479,11 +551,8 @@ impl ZCodeApp {
         let Some(profile) = self.tools[tool_index].profile(id) else {
             return false;
         };
-        match store.save_current_account(
-            &self.roots,
-            Some(&profile.manifest.name),
-            Some(&profile),
-        ) {
+        match store.save_current_account(&self.roots, Some(&profile.manifest.name), Some(&profile))
+        {
             Ok(_) => {
                 self.set_ok(format!(
                     "已更新 {} 账号备份：{}",
@@ -840,12 +909,13 @@ impl ZCodeApp {
             {
                 self.save_new(ui.ctx());
             }
-            let refresh_label = if self.refreshing { "刷新中…" } else { "刷新" };
+            let refresh_label = if self.refreshing {
+                "刷新中…"
+            } else {
+                "刷新"
+            };
             if ui
-                .add_enabled(
-                    !self.refreshing,
-                    egui::Button::new(refresh_label),
-                )
+                .add_enabled(!self.refreshing, egui::Button::new(refresh_label))
                 .on_hover_text("立即更新账号列表；当前账号与运行状态在后台探测，完成后自动更新显示")
                 .clicked()
             {
@@ -857,7 +927,40 @@ impl ZCodeApp {
                     Err(error) => self.set_error(error),
                 }
             }
+            if ui
+                .button(RichText::new("导入账号").color(Color32::from_rgb(32, 132, 88)))
+                .on_hover_text("从本工具导出的移植文件（zam-zcode-accounts.json）导入账号；ZCode 快照包含大量文件，仅支持文件导入")
+                .clicked()
+            {
+                self.transfer_import = Some(TransferImportState {
+                    target: TransferTarget::ZCode,
+                    path: String::new(),
+                    text: String::new(),
+                });
+            }
+            if ui
+                .add_enabled(!self.accounts.is_empty(), egui::Button::new("导出全部"))
+                .on_hover_text("把全部 ZCode 账号备份导出为单个 JSON 移植文件，可在另一台电脑导入")
+                .clicked()
+            {
+                self.open_export_window(TransferTarget::ZCode, None);
+            }
         });
+        egui::CollapsingHeader::new("备份的配置文件路径")
+            .id_salt("zcode_backup_paths")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                for tag in FULL_TAGS {
+                    let candidate = candidate_by_tag(tag);
+                    let path = self.roots.resolve(candidate);
+                    let path_str = path.to_string_lossy();
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("• {tag}")).weak().monospace());
+                        ui.label(RichText::new(path_str.as_ref()).monospace());
+                    });
+                }
+            });
         ui.add_space(14.0);
 
         if self.accounts.is_empty() {
@@ -917,12 +1020,7 @@ impl ZCodeApp {
                             cell_label(ui, "—", 88.0, RichText::new("—").weak())
                                 .on_hover_text("通过「编辑」设置手机号码");
                         } else {
-                            cell_label(
-                                ui,
-                                &stored_phone,
-                                88.0,
-                                RichText::new(&stored_phone),
-                            );
+                            cell_label(ui, &stored_phone, 88.0, RichText::new(&stored_phone));
                         }
                         let identity_text = profile
                             .manifest
@@ -972,6 +1070,13 @@ impl ZCodeApp {
                                 self.update_profile(&id);
                             }
                             if ui
+                                .button("导出")
+                                .on_hover_text("导出为单个 JSON 移植文件，可在另一台电脑导入")
+                                .clicked()
+                            {
+                                self.open_export_window(TransferTarget::ZCode, Some(id.clone()));
+                            }
+                            if ui
                                 .button(RichText::new("删除").color(Color32::from_rgb(180, 48, 48)))
                                 .clicked()
                             {
@@ -985,19 +1090,6 @@ impl ZCodeApp {
     }
 
     fn tool_accounts_page(&mut self, ui: &mut egui::Ui) {
-        // 工具选择器
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("工具").strong());
-            for (index, store) in TOOL_STORES.iter().enumerate() {
-                if ui
-                    .selectable_label(self.tool_page == index, store.tab)
-                    .on_hover_text(store.display)
-                    .clicked()
-                {
-                    self.tool_page = index;
-                }
-            }
-        });
         ui.add_space(6.0);
 
         let tool_index = self.tool_page;
@@ -1020,7 +1112,9 @@ impl ZCodeApp {
         self.tool_identity_banner(tool_index, ui);
         ui.add_space(8.0);
 
-        let default_name = self.tools[tool_index].identity.default_name(store.id_prefix);
+        let default_name = self.tools[tool_index]
+            .identity
+            .default_name(store.id_prefix);
         let can_save =
             self.tools[tool_index].pending_save_name().is_some() || default_name.is_some();
         ui.horizontal(|ui| {
@@ -1057,6 +1151,40 @@ impl ZCodeApp {
                     Err(error) => self.set_error(error),
                 }
             }
+            if store.key == "gemini"
+                && ui
+                    .button(RichText::new("登录账号").color(Color32::from_rgb(32, 132, 88)))
+                    .on_hover_text("使用 Google 官方 OAuth 登录新的 Gemini / Antigravity (agy) 账号")
+                    .clicked()
+            {
+                self.gemini_login = Some(GeminiLoginState::default());
+            }
+            if ui
+                .button(RichText::new("导入账号").color(Color32::from_rgb(32, 132, 88)))
+                .on_hover_text(match store.key {
+                    "codebuddy" => "从本工具导出的移植文件、WorkBuddy JSON 数组或单个 settings.json 导入；导入只创建备份，不切换当前账号",
+                    "claude" => "从本工具导出的移植文件、settings.json 或 .credentials.json 导入；导入只创建备份，不切换当前账号",
+                    "codex" => "从本工具导出的移植文件或 auth.json 导入；导入只创建备份，不切换当前账号",
+                    _ => "从本工具导出的移植文件或另一台机器的 OAuth 凭据 JSON 导入；导入只创建备份，不切换当前账号",
+                })
+                .clicked()
+            {
+                self.transfer_import = Some(TransferImportState {
+                    target: TransferTarget::Tool(tool_index),
+                    path: String::new(),
+                    text: String::new(),
+                });
+            }
+            if ui
+                .add_enabled(
+                    !self.tools[tool_index].accounts.is_empty(),
+                    egui::Button::new("导出全部"),
+                )
+                .on_hover_text("把全部账号备份导出为单个 JSON 移植文件（也可复制到剪贴板），可在另一台电脑导入")
+                .clicked()
+            {
+                self.open_export_window(TransferTarget::Tool(tool_index), None);
+            }
             if ui
                 .button(RichText::new("清空账号").color(Color32::from_rgb(180, 48, 48)))
                 .on_hover_text("自动备份当前登录状态后清除凭据，恢复到未登录的原始状态，方便重新登录其他账号")
@@ -1065,6 +1193,25 @@ impl ZCodeApp {
                 self.confirm = Some(ConfirmAction::ToolClear(tool_index));
             }
         });
+        egui::CollapsingHeader::new("备份的配置文件路径")
+            .id_salt(format!("tool_backup_paths_{}", store.key))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                let base = store.base(&self.roots);
+                for path_entry in store.paths {
+                    let path = base.join(path_entry.relative);
+                    let path_str = path.to_string_lossy();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("• {}", path_entry.tag))
+                                .weak()
+                                .monospace(),
+                        );
+                        ui.label(RichText::new(path_str.as_ref()).monospace());
+                    });
+                }
+            });
         ui.add_space(14.0);
 
         if self.tools[tool_index].accounts.is_empty() {
@@ -1163,6 +1310,18 @@ impl ZCodeApp {
                                 .clicked()
                             {
                                 self.do_tool_update(tool_index, &id);
+                            }
+                            if ui
+                                .button("导出")
+                                .on_hover_text(
+                                    "导出为单个 JSON 移植文件（也可复制到剪贴板），可在另一台电脑导入",
+                                )
+                                .clicked()
+                            {
+                                self.open_export_window(
+                                    TransferTarget::Tool(tool_index),
+                                    Some(id.clone()),
+                                );
                             }
                             if ui
                                 .button(RichText::new("删除").color(Color32::from_rgb(180, 48, 48)))
@@ -1451,8 +1610,9 @@ impl ZCodeApp {
                         egui::TextEdit::singleline(&mut editor.alias)
                             .hint_text("例如：工作主号（留空表示清除别名）"),
                     );
-                    confirmed =
-                        confirmed || (input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                    confirmed = confirmed
+                        || (input.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter)));
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -1462,8 +1622,9 @@ impl ZCodeApp {
                         egui::TextEdit::singleline(&mut editor.phone)
                             .hint_text("选填，留空表示清除手机号码"),
                     );
-                    confirmed =
-                        confirmed || (input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                    confirmed = confirmed
+                        || (input.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter)));
                 });
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
@@ -1596,6 +1757,437 @@ impl ZCodeApp {
         }
     }
 
+    fn gemini_login_window(&mut self, ctx: &egui::Context) {
+        let Some(mut login_state) = self.gemini_login.take() else {
+            return;
+        };
+
+        let mut close_requested = false;
+        let mut do_exchange = false;
+
+        egui::Window::new("登录 Gemini / Antigravity (agy) 账号")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                ui.label(RichText::new("使用 Google 官方 OAuth 授权登录新的 Gemini / agy 账号。").strong());
+                ui.add_space(6.0);
+
+                ui.label("步骤 1：点击下方按钮在浏览器中打开 Google 授权页面并完成登录；");
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("打开浏览器授权").strong()).clicked() {
+                        let auth_url = gemini::build_agy_auth_url();
+                        if let Err(e) = cli_accounts::open_url(&auth_url) {
+                            login_state.error = Some(e);
+                        } else {
+                            login_state.error = None;
+                        }
+                    }
+                    if ui.button("复制授权链接").clicked() {
+                        let auth_url = gemini::build_agy_auth_url();
+                        ui.ctx().output_mut(|o| {
+                            o.commands.push(egui::OutputCommand::CopyText(auth_url));
+                        });
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label("步骤 2：授权完成后，浏览器会重定向到 localhost:8085。复制地址栏中 code= 后面（到 & 符号之前）的授权码，或在页面直接复制授权码，粘贴在下方：");
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("授权码：");
+                    let input = ui.add_sized(
+                        [380.0, 28.0],
+                        egui::TextEdit::singleline(&mut login_state.auth_code)
+                            .hint_text("例如：4/0A... 粘贴完整授权码或重定向 URL"),
+                    );
+                    if input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        do_exchange = true;
+                    }
+                });
+
+                if let Some(err) = &login_state.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(Color32::from_rgb(190, 48, 48), err);
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let can_submit = !login_state.auth_code.trim().is_empty() && !login_state.submitting;
+                    if ui.add_enabled(can_submit, egui::Button::new(RichText::new("完成登录").strong())).clicked() {
+                        do_exchange = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        close_requested = true;
+                    }
+                });
+            });
+
+        if do_exchange {
+            let mut raw_code = login_state.auth_code.trim().to_string();
+            // 如果用户直接粘贴了完整的重定向 URL，自动提取 code 参数
+            if raw_code.contains("code=") {
+                if let Some(pos) = raw_code.find("code=") {
+                    let after = &raw_code[pos + 5..];
+                    let end_pos = after.find('&').unwrap_or(after.len());
+                    raw_code = after[..end_pos].to_string();
+                }
+            }
+            raw_code = url_decode_simple(&raw_code);
+
+            match gemini::exchange_and_save_token(&self.roots, &raw_code) {
+                Ok(account_desc) => {
+                    self.set_ok(format!(
+                        "登录成功：{account_desc}，已更新本地 Antigravity 凭据"
+                    ));
+                    self.refresh();
+                    self.begin_refresh(ctx);
+                    return;
+                }
+                Err(e) => {
+                    login_state.error = Some(format!("登录失败: {e}"));
+                    self.gemini_login = Some(login_state);
+                }
+            }
+        } else if !close_requested {
+            self.gemini_login = Some(login_state);
+        }
+    }
+
+    /// 打开导出窗口并立即生成移植文件内容。
+    fn open_export_window(&mut self, target: TransferTarget, account_id: Option<String>) {
+        let tool_key = match target {
+            TransferTarget::ZCode => transfer::ZCODE_TOOL_KEY,
+            TransferTarget::Tool(index) => self.tools[index].store.key,
+        };
+        let ids: Vec<String> = account_id.iter().cloned().collect();
+        let (json, error) = match target {
+            TransferTarget::ZCode => match transfer::export_zcode_accounts(&self.roots, &ids) {
+                Ok(json) => (json, None),
+                Err(error) => (String::new(), Some(error)),
+            },
+            TransferTarget::Tool(index) => {
+                let store = self.tools[index].store;
+                match transfer::export_tool_accounts(store, &self.roots, &ids) {
+                    Ok(json) => (json, None),
+                    Err(error) => (String::new(), Some(error)),
+                }
+            }
+        };
+        let save_path = self
+            .roots
+            .user_profile
+            .join(transfer::default_file_name(tool_key))
+            .to_string_lossy()
+            .into_owned();
+        self.transfer_export = Some(TransferExportState {
+            target,
+            account_id,
+            json,
+            error,
+            save_path,
+        });
+    }
+
+    /// 执行导入：优先文件路径，其次粘贴文本。
+    fn run_transfer_import(&mut self, path: &str, text: &str) {
+        let target = self
+            .transfer_import
+            .as_ref()
+            .map(|state| state.target)
+            .expect("import window open");
+        let result = match target {
+            TransferTarget::ZCode => {
+                if !path.trim().is_empty() {
+                    transfer::import_zcode_file(&self.roots, std::path::Path::new(path.trim()))
+                } else {
+                    transfer::import_zcode_text(&self.roots, text)
+                }
+            }
+            TransferTarget::Tool(index) => {
+                let store = self.tools[index].store;
+                if !path.trim().is_empty() {
+                    transfer::import_tool_file(store, &self.roots, std::path::Path::new(path.trim()))
+                } else {
+                    transfer::import_tool_text(store, &self.roots, text)
+                }
+            }
+        };
+        self.transfer_import = None;
+        match result {
+            Ok(result) => {
+                self.refresh();
+                self.set_ok(format!(
+                    "导入完成：成功 {} 个，跳过 {} 个。可在列表中切换使用。",
+                    result.imported, result.skipped
+                ));
+            }
+            Err(error) => self.set_error(error),
+        }
+    }
+
+    /// 通用导入窗口：文件路径 + 粘贴文本（CLI 工具支持剪贴板；ZCode 快照
+    /// 包含大量文件，只走文件通道）。
+    fn transfer_import_window(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.transfer_import.as_mut() else {
+            return;
+        };
+        let target = state.target;
+        let (title, tab) = match target {
+            TransferTarget::ZCode => ("导入 ZCode 账号", "ZCode"),
+            TransferTarget::Tool(index) => (
+                "导入账号",
+                self.tools[index].store.tab,
+            ),
+        };
+        let is_tool = matches!(target, TransferTarget::Tool(_));
+        let mut do_import = false;
+        let mut do_paste = false;
+        let mut close_requested = false;
+
+        egui::Window::new(format!("{title}（{tab}）"))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                match target {
+                    TransferTarget::ZCode => {
+                        ui.label("选择本工具导出的移植文件（zam-zcode-accounts.json）导入 ZCode 账号。");
+                        ui.label("ZCode 快照包含大量文件（会话、本地存储等），仅支持文件导入。");
+                    }
+                    TransferTarget::Tool(index) => {
+                        let key = self.tools[index].store.key;
+                        ui.label(match key {
+                            "codebuddy" => "支持：本工具导出的移植文件、WorkBuddy / wb-switch JSON 数组、单个 ~/.codebuddy/settings.json。",
+                            "claude" => "支持：本工具导出的移植文件、~/.claude/settings.json（端点 Token）、.credentials.json（OAuth 凭据）。",
+                            "codex" => "支持：本工具导出的移植文件、~/.codex/auth.json（ChatGPT OAuth 或 API Key）。",
+                            _ => "支持：本工具导出的移植文件、另一台机器的 oauth_creds.json 或 antigravity-oauth-token。",
+                        });
+                        ui.label("导入只创建备份，不改变当前登录状态。");
+                    }
+                }
+                ui.label(
+                    RichText::new("⚠ 导入内容包含登录凭据，请确认来源可信，不要导入来路不明的文件。")
+                        .color(Color32::from_rgb(190, 112, 28)),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("JSON 文件");
+                    ui.add_sized(
+                        [420.0, 26.0],
+                        egui::TextEdit::singleline(&mut state.path)
+                            .hint_text("例如 /home/user/Downloads/zam-gemini-accounts.json"),
+                    );
+                });
+                if is_tool {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("或粘贴 JSON").strong());
+                        if ui
+                            .button("从剪贴板粘贴")
+                            .on_hover_text("读取系统剪贴板中的移植文件 / 凭据 JSON 文本")
+                            .clicked()
+                        {
+                            do_paste = true;
+                        }
+                    });
+                    ui.add_sized(
+                        [520.0, 140.0],
+                        egui::TextEdit::multiline(&mut state.text)
+                            .code_editor()
+                            .hint_text("粘贴导出的 JSON（也可直接在此输入框按 Ctrl+V 粘贴）"),
+                    );
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() {
+                        close_requested = true;
+                    }
+                    let can_import =
+                        !state.path.trim().is_empty() || (is_tool && !state.text.trim().is_empty());
+                    if ui
+                        .add_enabled(
+                            can_import,
+                            egui::Button::new(RichText::new("导入").color(Color32::WHITE)),
+                        )
+                        .clicked()
+                    {
+                        do_import = true;
+                    }
+                });
+            });
+
+        if do_paste {
+            let text = self.transfer_import.as_mut().map(|state| &mut state.text);
+            if let Some(text) = text {
+                match clipboard::read_text() {
+                    Ok(clipboard_text) if !clipboard_text.trim().is_empty() => {
+                        *text = clipboard_text;
+                    }
+                    Ok(_) => self.set_error("剪贴板为空"),
+                    Err(error) => self.set_error(error),
+                }
+            }
+        }
+        if close_requested {
+            self.transfer_import = None;
+        }
+        if do_import {
+            let (path, text) = self
+                .transfer_import
+                .as_ref()
+                .map(|state| (state.path.clone(), state.text.clone()))
+                .expect("import window open");
+            self.run_transfer_import(&path, &text);
+        }
+    }
+
+    /// 通用导出窗口：预览移植文件 + 复制到剪贴板（CLI 工具）+ 保存到文件。
+    fn transfer_export_window(&mut self, ctx: &egui::Context) {
+        if self.transfer_export.is_none() {
+            return;
+        }
+        let (target, account_id) = {
+            let state = self.transfer_export.as_ref().expect("checked above");
+            (state.target, state.account_id.clone())
+        };
+        let is_tool = matches!(target, TransferTarget::Tool(_));
+        let (tab, account_name) = match target {
+            TransferTarget::ZCode => ("ZCode", self.account_display_name(account_id.as_deref())),
+            TransferTarget::Tool(index) => (
+                self.tools[index].store.tab,
+                self.tool_account_display_name(index, account_id.as_deref()),
+            ),
+        };
+        let scope = account_name
+            .map(|name| format!("账号「{name}」"))
+            .unwrap_or_else(|| "全部账号".into());
+        let mut do_copy = false;
+        let mut do_save = false;
+        let mut close_requested = false;
+
+        egui::Window::new(format!("导出账号（{tab} · {scope}）"))
+            .collapsible(false)
+            .resizable(true)
+            .default_size([560.0, 420.0])
+            .show(ctx, |ui| {
+                let state = self.transfer_export.as_mut().expect("checked above");
+                if let Some(error) = &state.error {
+                    ui.colored_label(Color32::from_rgb(190, 48, 48), error);
+                } else {
+                    ui.label(
+                        RichText::new("⚠ 导出文件包含登录凭据，请像密码一样保管，不要上传或分享。")
+                            .color(Color32::from_rgb(190, 112, 28)),
+                    );
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            ui.add_sized(
+                                [520.0, 200.0],
+                                egui::Label::new(
+                                    RichText::new(state.json.as_str()).monospace().weak(),
+                                )
+                                .wrap(),
+                            );
+                        });
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if is_tool && state.error.is_none() && ui
+                        .button("复制到剪贴板")
+                        .on_hover_text("复制整个移植文件 JSON，到另一台电脑的导入窗口粘贴")
+                        .clicked()
+                    {
+                        do_copy = true;
+                    }
+                    if state.error.is_none() {
+                        ui.add_sized(
+                            [330.0, 26.0],
+                            egui::TextEdit::singleline(&mut state.save_path),
+                        );
+                        if ui.button("保存到文件").clicked() {
+                            do_save = true;
+                        }
+                    }
+                    if ui.button("关闭").clicked() {
+                        close_requested = true;
+                    }
+                });
+            });
+
+        if do_copy {
+            if let Some(json) = self.transfer_export.as_ref().map(|state| state.json.clone()) {
+                match clipboard::write_text(&json) {
+                    Ok(()) => self.set_ok("已复制到剪贴板，可在另一台电脑的导入窗口粘贴"),
+                    Err(error) => self.set_error(error),
+                }
+            }
+        }
+        if do_save {
+            let path = self
+                .transfer_export
+                .as_ref()
+                .map(|state| state.save_path.trim().to_string())
+                .expect("export window open");
+            let json = self
+                .transfer_export
+                .as_ref()
+                .map(|state| state.json.clone())
+                .expect("export window open");
+            match fs::write(&path, json.as_bytes()) {
+                Ok(()) => self.set_ok(format!("已导出到 {path}")),
+                Err(error) => self.set_error(format!("写入 {path} 失败: {error}")),
+            }
+        }
+        if close_requested {
+            self.transfer_export = None;
+        }
+    }
+
+    fn account_display_name(&self, id: Option<&str>) -> Option<String> {
+        let id = id?;
+        self.accounts
+            .iter()
+            .find(|profile| profile.manifest.id == id)
+            .map(|profile| profile.manifest.display_name().to_string())
+    }
+
+    fn tool_account_display_name(&self, tool_index: usize, id: Option<&str>) -> Option<String> {
+        let id = id?;
+        self.tools[tool_index]
+            .accounts
+            .iter()
+            .find(|profile| profile.manifest.id == id)
+            .map(|profile| profile.manifest.display_name().to_string())
+    }
+}
+
+fn url_decode_simple(input: &str) -> String {
+    let mut result = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(val) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
+                result.push(val);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            result.push(b' ');
+            i += 1;
+            continue;
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&result).into_owned()
+}
+
+impl ZCodeApp {
     fn auto_send_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("自动发送消息");
         ui.label(
@@ -1633,7 +2225,9 @@ impl ZCodeApp {
             );
             ui.add_space(6.0);
             ui.separator();
-            ui.label(RichText::new("定位测试（始终包含：激活窗口 + 滚动到顶部 + 悬停目标行）").strong());
+            ui.label(
+                RichText::new("定位测试（始终包含：激活窗口 + 滚动到顶部 + 悬停目标行）").strong(),
+            );
             ui.horizontal(|ui| {
                 ui.label("测试项目");
                 ui.checkbox(&mut self.test_click_session, "点击切换");
@@ -1646,17 +2240,20 @@ impl ZCodeApp {
                     input_message: self.test_input,
                     send_enter: self.test_send,
                 };
-                let can_test = !running && (!steps.input_message || !self.auto_message.trim().is_empty());
+                let can_test =
+                    !running && (!steps.input_message || !self.auto_message.trim().is_empty());
                 if ui
                     .add_enabled(can_test, egui::Button::new("执行测试"))
                     .on_hover_text(
                         "按勾选的步骤组合执行；全部不勾选 = 仅定位悬停，用于核对序号与位置",
                     )
-                    .on_disabled_hover_text(if steps.input_message && self.auto_message.trim().is_empty() {
-                        "勾选了「粘贴输入」但消息内容为空"
-                    } else {
-                        "正在执行中"
-                    })
+                    .on_disabled_hover_text(
+                        if steps.input_message && self.auto_message.trim().is_empty() {
+                            "勾选了「粘贴输入」但消息内容为空"
+                        } else {
+                            "正在执行中"
+                        },
+                    )
                     .clicked()
                 {
                     let request = AutoSendRequest {
@@ -1680,7 +2277,10 @@ impl ZCodeApp {
                     egui::TextEdit::singleline(&mut self.schedule_time).hint_text("HH:MM"),
                 );
                 ui.checkbox(&mut self.schedule_daily, "每天重复");
-                ui.label(RichText::new("（到点自动执行完整发送，期间请勿操作鼠标键盘；退出程序即失效）").weak());
+                ui.label(
+                    RichText::new("（到点自动执行完整发送，期间请勿操作鼠标键盘；退出程序即失效）")
+                        .weak(),
+                );
             });
             ui.horizontal(|ui| {
                 let button_label = if scheduled.is_some() && self.schedule_enabled {
@@ -1692,7 +2292,10 @@ impl ZCodeApp {
                 };
                 let can_send = !running && !self.auto_message.trim().is_empty();
                 if ui
-                    .add_enabled(can_send, egui::Button::new(RichText::new(button_label).strong()))
+                    .add_enabled(
+                        can_send,
+                        egui::Button::new(RichText::new(button_label).strong()),
+                    )
                     .on_hover_text("发送前会弹出确认")
                     .on_disabled_hover_text(if self.auto_message.trim().is_empty() {
                         "请先填写消息内容"
@@ -1707,16 +2310,19 @@ impl ZCodeApp {
                             message: self.auto_message.trim().to_string(),
                             steps: SendSteps::full(),
                         },
-                        schedule: self.schedule_enabled.then(|| {
-                            (self.schedule_time.trim().to_string(), self.schedule_daily)
-                        }),
+                        schedule: self
+                            .schedule_enabled
+                            .then(|| (self.schedule_time.trim().to_string(), self.schedule_daily)),
                     });
                 }
                 if scheduled.is_some() && ui.button("取消定时").clicked() {
                     self.cancel_schedule();
                 }
                 if let Some(desc) = &scheduled {
-                    ui.label(RichText::new(format!("已预约：{desc}")).color(Color32::from_rgb(32, 132, 88)));
+                    ui.label(
+                        RichText::new(format!("已预约：{desc}"))
+                            .color(Color32::from_rgb(32, 132, 88)),
+                    );
                 }
             });
         });
@@ -1730,9 +2336,7 @@ impl ZCodeApp {
                     ui.strong("执行日志");
                     if running {
                         ui.spinner();
-                        ui.label(
-                            RichText::new("执行中，请不要移动鼠标或敲键盘...").weak(),
-                        );
+                        ui.label(RichText::new("执行中，请不要移动鼠标或敲键盘...").weak());
                     } else if state.finished_ok == Some(false) {
                         ui.colored_label(Color32::from_rgb(190, 48, 48), "失败");
                     }
@@ -1803,12 +2407,21 @@ impl eframe::App for ZCodeApp {
                 {
                     self.page = Page::Accounts;
                 }
-                if ui
-                    .selectable_label(self.page == Page::ToolAccounts, "CLI 账号")
-                    .on_hover_text("Gemini / Codex / Claude Code 账号备份与切换")
-                    .clicked()
-                {
-                    self.page = Page::ToolAccounts;
+                for (index, store) in TOOL_STORES.iter().enumerate() {
+                    let page = match index {
+                        0 => Page::GeminiAccounts,
+                        1 => Page::CodexAccounts,
+                        2 => Page::ClaudeAccounts,
+                        _ => Page::CodeBuddyAccounts,
+                    };
+                    if ui
+                        .selectable_label(self.page == page, store.tab)
+                        .on_hover_text(store.display)
+                        .clicked()
+                    {
+                        self.page = page;
+                        self.tool_page = index;
+                    }
                 }
                 if ui
                     .selectable_label(self.page == Page::Cleanup, "清理")
@@ -1830,6 +2443,16 @@ impl eframe::App for ZCodeApp {
                     {
                         tray::EXIT_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui
+                        .button("Web 管理端")
+                        .on_hover_text("在浏览器中打开 Web 管理页面 (http://127.0.0.1:14596)")
+                        .clicked()
+                    {
+                        let _ = cli_accounts::open_url(&format!(
+                            "http://127.0.0.1:{}",
+                            crate::web::DEFAULT_WEB_PORT
+                        ));
                     }
                     let running = self.zcode_running.load(Ordering::SeqCst);
                     ui.colored_label(
@@ -1853,7 +2476,10 @@ impl eframe::App for ZCodeApp {
             ui.add_space(10.0);
             match self.page {
                 Page::Accounts => self.accounts_page(ui),
-                Page::ToolAccounts => self.tool_accounts_page(ui),
+                Page::GeminiAccounts
+                | Page::CodexAccounts
+                | Page::ClaudeAccounts
+                | Page::CodeBuddyAccounts => self.tool_accounts_page(ui),
                 Page::Cleanup => self.cleanup_page(ui),
                 Page::AutoSend => self.auto_send_page(ui),
             }
@@ -1874,6 +2500,9 @@ impl eframe::App for ZCodeApp {
         self.confirmation_window(&ctx);
         self.account_editor_window(&ctx);
         self.tool_editor_window(&ctx);
+        self.gemini_login_window(&ctx);
+        self.transfer_import_window(&ctx);
+        self.transfer_export_window(&ctx);
     }
 }
 
@@ -1924,7 +2553,8 @@ fn format_timestamp(timestamp: u64) -> String {
 
 /// 表格单元格：始终单行显示，超出列宽截断，悬停可查看完整内容。
 fn cell_label(ui: &mut egui::Ui, text: &str, max_width: f32, styled: RichText) -> egui::Response {
-    ui.add_sized([max_width, 20.0], egui::Label::new(styled).truncate()).on_hover_text(text)
+    ui.add_sized([max_width, 20.0], egui::Label::new(styled).truncate())
+        .on_hover_text(text)
 }
 
 /// 应用图标：基于 ZCode 图标加账户切换徽章，嵌入二进制供窗口/任务栏使用。
@@ -1970,6 +2600,7 @@ pub fn launch(start_hidden: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn recent_timestamp_is_readable() {
@@ -1979,5 +2610,130 @@ mod tests {
             .as_secs();
         assert_eq!(format_timestamp(now), "刚刚");
         assert_eq!(format_timestamp(now - 120), "2 分钟前");
+    }
+
+    #[test]
+    fn tool_account_name_updates_on_identity_change_and_preserves_manual_edit() {
+        let mut tool = ToolAccounts::new(&crate::gemini::STORE);
+        assert_eq!(tool.account_name, "");
+        assert_eq!(tool.last_detected_identity, None);
+
+        // 1. 初次检测到账号：自动填入默认名称
+        tool.identity = cli_accounts::CliIdentity {
+            email: Some("alice@example.com".into()),
+            auth_type: Some("Google".into()),
+            fingerprint: Some("fp_alice_123456".into()),
+        };
+        tool.sync_account_name_on_identity_change();
+        assert_eq!(tool.account_name, "alice");
+        assert_eq!(tool.last_detected_identity, Some(tool.identity.clone()));
+
+        // 2. 用户手动修改名称：同一账号刷新不覆盖修改
+        tool.account_name = "我的主力号".into();
+        tool.sync_account_name_on_identity_change();
+        assert_eq!(tool.account_name, "我的主力号");
+
+        // 3. 检测到新账号（换号）：自动覆盖更新为新账号默认名称
+        tool.identity = cli_accounts::CliIdentity {
+            email: Some("bob@example.com".into()),
+            auth_type: Some("Google".into()),
+            fingerprint: Some("fp_bob_789012".into()),
+        };
+        tool.sync_account_name_on_identity_change();
+        assert_eq!(tool.account_name, "bob");
+        assert_eq!(tool.last_detected_identity, Some(tool.identity.clone()));
+
+        // 4. 用户再次手动修改：同一账号保持
+        tool.account_name = "Bob临时号".into();
+        tool.sync_account_name_on_identity_change();
+        assert_eq!(tool.account_name, "Bob临时号");
+
+        // 5. 账号退出（未登录）：清空输入框与缓存
+        tool.identity = cli_accounts::CliIdentity::default();
+        tool.sync_account_name_on_identity_change();
+        assert_eq!(tool.account_name, "");
+        assert_eq!(tool.last_detected_identity, None);
+
+        // 6. 重新登录账号：再次自动填充
+        tool.identity = cli_accounts::CliIdentity {
+            email: Some("charlie@example.com".into()),
+            auth_type: None,
+            fingerprint: Some("fp_charlie_999".into()),
+        };
+        tool.sync_account_name_on_identity_change();
+        assert_eq!(tool.account_name, "charlie");
+    }
+
+    #[test]
+    fn zcode_account_name_updates_on_identity_change_and_preserves_manual_edit() {
+        let mut app = ZCodeApp {
+            roots: Roots {
+                user_profile: PathBuf::new(),
+                app_data: PathBuf::new(),
+            },
+            accounts: Vec::new(),
+            active_id: None,
+            current_identity: AccountIdentity::default(),
+            last_detected_identity: None,
+            account_name: String::new(),
+            auto_restart: true,
+            info_editor: None,
+            status: String::new(),
+            status_error: false,
+            page: Page::Accounts,
+            confirm: None,
+            auto_send_state: Arc::new(Mutex::new(AutoSendState::default())),
+            pinned_index: 1,
+            auto_message: String::new(),
+            test_click_session: false,
+            test_input: false,
+            test_send: false,
+            schedule_enabled: false,
+            schedule_time: String::new(),
+            schedule_daily: false,
+            schedule_cancel: Arc::new(Mutex::new(None)),
+            tools: Vec::new(),
+            tool_page: 0,
+            zcode_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            refresh_shared: Arc::new(Mutex::new(None)),
+            refresh_seq: 0,
+            refreshing: false,
+            gemini_login: None,
+            transfer_import: None,
+            transfer_export: None,
+        };
+
+        // 1. 初次检测到 ZCode 账号：自动填入默认名称
+        app.current_identity = AccountIdentity {
+            username: Some("dev_user".into()),
+            user_id: Some("1001".into()),
+            provider: Some("corp".into()),
+            fingerprint: Some("fp_dev_1111".into()),
+        };
+        app.sync_account_name_on_identity_change();
+        assert_eq!(app.account_name, "dev_user");
+        assert_eq!(
+            app.last_detected_identity,
+            Some(app.current_identity.clone())
+        );
+
+        // 2. 用户手动修改账户名称：账号未变时刷新保留用户输入
+        app.account_name = "我的开发账户".into();
+        app.sync_account_name_on_identity_change();
+        assert_eq!(app.account_name, "我的开发账户");
+
+        // 3. 切换检测到新账号：自动覆盖更新为新账号名称
+        app.current_identity = AccountIdentity {
+            username: Some("prod_user".into()),
+            user_id: Some("2002".into()),
+            provider: Some("corp".into()),
+            fingerprint: Some("fp_prod_2222".into()),
+        };
+        app.sync_account_name_on_identity_change();
+        assert_eq!(app.account_name, "prod_user");
+        assert_eq!(
+            app.last_detected_identity,
+            Some(app.current_identity.clone())
+        );
     }
 }

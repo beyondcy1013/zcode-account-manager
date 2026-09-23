@@ -149,7 +149,10 @@ fn find_window() -> Result<Window, String> {
             height,
         };
         let area = width * height;
-        if best.map(|current| area > current.width * current.height).unwrap_or(true) {
+        if best
+            .map(|current| area > current.width * current.height)
+            .unwrap_or(true)
+        {
             best = Some(window);
         }
     }
@@ -314,7 +317,11 @@ fn parse_hhmm(hhmm: &str) -> Result<(u32, u32), String> {
 
 /// 计算当前时刻到今天/下一个目标 HH:MM 的秒数。
 /// `allow_next_day` 为 false 时目标时刻不能早于当前时刻。
-fn day_seconds_diff(now_hms: (u32, u32, u32), target_hm: (u32, u32), allow_next_day: bool) -> Result<i64, String> {
+fn day_seconds_diff(
+    now_hms: (u32, u32, u32),
+    target_hm: (u32, u32),
+    allow_next_day: bool,
+) -> Result<i64, String> {
     let now_secs = (now_hms.0 * 3600 + now_hms.1 * 60 + now_hms.2) as i64;
     let target = (target_hm.0 * 3600 + target_hm.1 * 60) as i64;
     let mut diff = target - now_secs;
@@ -346,8 +353,7 @@ pub fn seconds_until(hhmm: &str, daily: bool) -> Result<u64, String> {
         _ => return Err(format!("系统时间输出异常：{text}")),
     };
     let parse = |v: &str| -> Result<u32, String> {
-        v.parse()
-            .map_err(|_| format!("系统时间输出异常：{text}"))
+        v.parse().map_err(|_| format!("系统时间输出异常：{text}"))
     };
     let now = (parse(h)?, parse(m)?, parse(s)?);
     Ok(day_seconds_diff(now, target, daily)?.max(0) as u64)

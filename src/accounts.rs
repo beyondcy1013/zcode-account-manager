@@ -1,6 +1,4 @@
-use crate::{
-    candidate_by_tag, copy_path, remove_path, Roots, FULL_TAGS, PRESERVE_IF_ABSENT_TAGS,
-};
+use crate::{candidate_by_tag, copy_path, remove_path, Roots, FULL_TAGS, PRESERVE_IF_ABSENT_TAGS};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
@@ -43,7 +41,7 @@ impl AccountManifest {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountProfile {
     pub directory: PathBuf,
     pub manifest: AccountManifest,
@@ -65,7 +63,7 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn new_account_id() -> String {
+pub(crate) fn new_account_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -284,11 +282,38 @@ pub fn switch_account(roots: &Roots, target: &AccountProfile) -> Result<(), Stri
     }
     if let Some(current_id) = active_account(roots) {
         if current_id != target.manifest.id {
-            if let Some(current) = list_accounts(roots)?
-                .into_iter()
-                .find(|profile| profile.manifest.id == current_id)
-            {
-                save_current_account(roots, Some(&current.manifest.name), Some(&current))?;
+            let identity = crate::identity::detect(roots);
+            let accounts = list_accounts(roots).unwrap_or_default();
+            if let Some(current) = accounts.iter().find(|p| p.manifest.id == current_id) {
+                // 只有当本机指纹与 active 账号指纹明确冲突（两者均存在且不相等）时才阻止就地更新，
+                // 避免把已换登的新账号误覆盖到旧账号。若无指纹或指纹匹配，则正常自动保存最新状态。
+                let is_conflict = match (&identity.fingerprint, &current.manifest.fingerprint) {
+                    (Some(curr_fp), Some(saved_fp)) => curr_fp != saved_fp,
+                    _ => false,
+                };
+                if !is_conflict {
+                    let _ = save_current_account_with_identity(
+                        roots,
+                        Some(&current.manifest.name),
+                        Some(current),
+                        &identity,
+                    );
+                } else if identity.is_present() {
+                    // 若本机指纹明确属于列表中的另一已有账号，则更新对应账号；若为全新账号则另存，绝不覆盖 current！
+                    if let Some(matched) = accounts.iter().find(|p| {
+                        identity.fingerprint.is_some()
+                            && p.manifest.fingerprint == identity.fingerprint
+                    }) {
+                        let _ = save_current_account_with_identity(
+                            roots,
+                            Some(&matched.manifest.name),
+                            Some(matched),
+                            &identity,
+                        );
+                    } else {
+                        let _ = save_current_account_with_identity(roots, None, None, &identity);
+                    }
+                }
             }
         }
     }
@@ -535,8 +560,9 @@ mod tests {
 
         // 更新备份（覆盖保存）时保留手机号码
         fs::write(&credentials, b"account-a-new").unwrap();
-        let updated = save_current_account(&roots, Some(&with_phone.manifest.name), Some(&with_phone))
-            .unwrap();
+        let updated =
+            save_current_account(&roots, Some(&with_phone.manifest.name), Some(&with_phone))
+                .unwrap();
         assert_eq!(updated.manifest.phone.as_deref(), Some("13800138000"));
 
         // 从磁盘重新加载仍然存在，空值即清除

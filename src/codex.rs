@@ -6,7 +6,9 @@
 //! - `config.toml`：用户配置（模型、Provider 等），切换账号时保留本机现状。
 //! 快照与切换机制由 `cli_accounts` 提供。
 
-use crate::cli_accounts::{short_digest, CliIdentity, ToolPath, ToolStore};
+use crate::cli_accounts::{
+    short_digest, CliIdentity, ImportResult, ToolPath, ToolStore,
+};
 use crate::Roots;
 use serde_json::Value;
 use std::{fs, path::PathBuf};
@@ -50,58 +52,110 @@ pub static STORE: ToolStore = ToolStore {
 
 /// 读取 `~/.codex/auth.json` 识别当前账号：ChatGPT OAuth 优先，API Key 补充。
 pub fn detect(roots: &Roots) -> CliIdentity {
-    let mut identity = CliIdentity::default();
     let auth_path = codex_dir(roots).join("auth.json");
     let Some(bytes) = fs::read(&auth_path).ok() else {
-        return identity;
+        return CliIdentity::default();
     };
     let value = serde_json::from_slice::<Value>(&bytes).ok();
+    identity_from_auth(value.as_ref(), &bytes)
+}
+
+/// 从 auth.json 内容识别账号；`bytes` 为文件原始内容，用于兜底指纹。
+fn identity_from_auth(value: Option<&Value>, bytes: &[u8]) -> CliIdentity {
+    let mut identity = CliIdentity::default();
 
     // ChatGPT OAuth 登录：email 来自 id_token，指纹取稳定不变的 refresh_token
-    if let Some(value) = value.as_ref() {
-        let tokens = value.get("tokens").filter(|tokens| !tokens.is_null());
-        if let Some(tokens) = tokens {
-            let id_token = tokens
-                .get("id_token")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            identity.email = crate::identity::decode_jwt_identity(id_token);
-            identity.fingerprint = tokens
-                .get("refresh_token")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|token| !token.is_empty())
-                .map(|token| short_digest(token.as_bytes()))
-                .or_else(|| Some(short_digest(&bytes)));
-            identity.auth_type = Some(match value.get("auth_mode").and_then(Value::as_str) {
-                Some("chatgpt") | None => "ChatGPT 账号".to_string(),
-                Some(other) => format!("Codex {other}"),
-            });
-        }
+    if let Some(tokens) = value
+        .and_then(|value| value.get("tokens"))
+        .filter(|tokens| !tokens.is_null())
+    {
+        let id_token = tokens
+            .get("id_token")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        identity.email = crate::identity::decode_jwt_identity(id_token);
+        identity.fingerprint = tokens
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(|token| short_digest(token.as_bytes()))
+            .or_else(|| Some(short_digest(bytes)));
+        let auth_mode = value
+            .and_then(|value| value.get("auth_mode"))
+            .and_then(Value::as_str);
+        identity.auth_type = Some(match auth_mode {
+            Some("chatgpt") | None => "ChatGPT 账号".to_string(),
+            Some(other) => format!("Codex {other}"),
+        });
     }
 
     // API Key 模式（auth.json 里只写 OPENAI_API_KEY）
-    if let Some(value) = value.as_ref() {
-        if identity.auth_type.is_none() {
-            if let Some(key) = value
-                .get("OPENAI_API_KEY")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|key| !key.is_empty())
-            {
-                identity.auth_type = Some("API Key".to_string());
-                if identity.fingerprint.is_none() {
-                    identity.fingerprint = Some(short_digest(key.as_bytes()));
-                }
+    if identity.auth_type.is_none() {
+        if let Some(key) = value
+            .and_then(|value| value.get("OPENAI_API_KEY"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            identity.auth_type = Some("API Key".to_string());
+            if identity.fingerprint.is_none() {
+                identity.fingerprint = Some(short_digest(key.as_bytes()));
             }
         }
     }
 
     // 都识别不出时退回整个文件摘要，至少保证备份可区分
     if identity.fingerprint.is_none() {
-        identity.fingerprint = Some(short_digest(&bytes));
+        identity.fingerprint = Some(short_digest(bytes));
     }
     identity
+}
+
+/// 原生格式导入：接受另一台机器上的 `~/.codex/auth.json` 对象（ChatGPT OAuth
+/// `tokens` 或 `OPENAI_API_KEY`）。导入只创建备份，不切换账号。
+pub fn import_native_text(
+    store: &ToolStore,
+    roots: &Roots,
+    text: &str,
+) -> Result<ImportResult, String> {
+    let trimmed = text.trim();
+    let value: Value = serde_json::from_str(trimmed)
+        .map_err(|error| format!("导入内容不是合法 JSON: {error}"))?;
+    if !value.is_object() {
+        return Err("Codex 导入内容必须是 JSON 对象（auth.json）".into());
+    }
+    if value.get("tokens").filter(|tokens| !tokens.is_null()).is_none()
+        && value
+            .get("OPENAI_API_KEY")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .is_none()
+    {
+        return Err("未识别到 Codex 登录数据：需要 tokens（ChatGPT OAuth）或 OPENAI_API_KEY".into());
+    }
+
+    let identity = identity_from_auth(Some(&value), trimmed.as_bytes());
+    let name = identity
+        .default_name("Codex")
+        .unwrap_or_else(|| "我的Codex账号".into());
+    let bytes = serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?;
+    let mut files = std::collections::BTreeMap::new();
+    files.insert("auth".to_string(), bytes);
+    store
+        .import_account_files(
+            roots,
+            &name,
+            None,
+            Some(&identity.describe()),
+            identity.fingerprint.as_deref(),
+            &files,
+        )
+        .map(|_| ImportResult {
+            imported: 1,
+            skipped: 0,
+        })
 }
 
 #[cfg(test)]
@@ -229,10 +283,14 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let roots = roots(&temp);
         write_auth(&roots, r#"{"OPENAI_API_KEY":"sk-key-a"}"#);
-        let account_a = STORE.save_current_account(&roots, Some("Codex A"), None).unwrap();
+        let account_a = STORE
+            .save_current_account(&roots, Some("Codex A"), None)
+            .unwrap();
 
         write_auth(&roots, r#"{"OPENAI_API_KEY":"sk-key-b"}"#);
-        let account_b = STORE.save_current_account(&roots, Some("Codex B"), None).unwrap();
+        let account_b = STORE
+            .save_current_account(&roots, Some("Codex B"), None)
+            .unwrap();
 
         // config.toml 不在快照里（保存时不存在），切换后保留本机现状
         let config = STORE.path_by_tag(&roots, "config");
@@ -250,5 +308,43 @@ mod tests {
             fs::read(STORE.path_by_tag(&roots, "auth")).unwrap(),
             br#"{"OPENAI_API_KEY":"sk-key-b"}"#,
         );
+    }
+
+    #[test]
+    fn native_import_accepts_auth_json() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+
+        // API Key 模式
+        let result =
+            import_native_text(&STORE, &roots, r#"{"OPENAI_API_KEY":"sk-import"}"#).unwrap();
+        assert_eq!(result.imported, 1);
+        let accounts = STORE.list_accounts(&roots).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert!(accounts[0].manifest.name.starts_with("Codex"));
+        assert!(accounts[0].manifest.identity.as_deref().unwrap().contains("API Key"));
+        assert!(accounts[0].directory.join("data/auth").is_file());
+        assert!(!codex_dir(&roots).join("auth.json").exists());
+
+        // ChatGPT OAuth 模式：按 id_token 邮箱命名
+        let id_token = jwt_with_claims(r#"{"email":"import@gmail.com"}"#);
+        let result = import_native_text(
+            &STORE,
+            &roots,
+            &format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"id_token":"{id_token}","refresh_token":"rt-import"}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(result.imported, 1);
+        assert!(STORE
+            .list_accounts(&roots)
+            .unwrap()
+            .iter()
+            .any(|p| p.manifest.name == "import"));
+
+        // 无法识别的内容报错
+        assert!(import_native_text(&STORE, &roots, r#"{"model":"gpt-5"}"#).is_err());
+        assert!(import_native_text(&STORE, &roots, "[1,2]").is_err());
     }
 }

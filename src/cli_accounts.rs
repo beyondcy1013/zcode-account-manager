@@ -8,8 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     cmp::Reverse,
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
@@ -20,6 +19,13 @@ use crate::accounts::{AccountManifest, AccountProfile};
 
 pub const MANIFEST_VERSION: u32 = 1;
 static ACCOUNT_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// 导入统计：成功导入与跳过的账号数量。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImportResult {
+    pub imported: usize,
+    pub skipped: usize,
+}
 
 /// CLI 工具登录状态涉及的文件，相对路径基于该工具的 `base_dir`。
 pub struct ToolPath {
@@ -174,8 +180,15 @@ impl ToolStore {
             .count()
     }
 
-    fn snapshot_to(&self, roots: &Roots, target: &Path, manifest: &AccountManifest) -> Result<(), String> {
-        let parent = target.parent().ok_or(format!("{} 备份目录无效", self.display))?;
+    fn snapshot_to(
+        &self,
+        roots: &Roots,
+        target: &Path,
+        manifest: &AccountManifest,
+    ) -> Result<(), String> {
+        let parent = target
+            .parent()
+            .ok_or(format!("{} 备份目录无效", self.display))?;
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         let temp = parent.join(format!(".{}.tmp", manifest.id));
         if temp.exists() {
@@ -297,7 +310,8 @@ impl ToolStore {
         Ok(profiles)
     }
 
-    fn restore_data(&self, roots: &Roots, data: &Path) -> Result<(), String> {        for tag in self.tags {
+    fn restore_data(&self, roots: &Roots, data: &Path) -> Result<(), String> {
+        for tag in self.tags {
             // 配置类项目在旧快照缺失时保留本机现状；其余项目必须先清理，
             // 避免上一账号的残留和新账号混在一起。
             if self.preserve_if_absent.contains(&tag) && !data.join(tag).exists() {
@@ -326,12 +340,36 @@ impl ToolStore {
         }
         if let Some(current_id) = self.active_account(roots) {
             if current_id != target.manifest.id {
-                if let Some(current) = self
-                    .list_accounts(roots)?
-                    .into_iter()
-                    .find(|profile| profile.manifest.id == current_id)
-                {
-                    self.save_current_account(roots, Some(&current.manifest.name), Some(&current))?;
+                let identity = (self.detect)(roots);
+                let accounts = self.list_accounts(roots).unwrap_or_default();
+                if let Some(current) = accounts.iter().find(|p| p.manifest.id == current_id) {
+                    // 只有当本机指纹与 active 账号指纹明确冲突（两者均存在且不相等）时才阻止就地更新，
+                    // 避免把已换登的新账号误覆盖到旧账号。若无指纹或指纹匹配，则正常自动保存最新状态。
+                    let is_conflict = match (&identity.fingerprint, &current.manifest.fingerprint) {
+                        (Some(curr_fp), Some(saved_fp)) => curr_fp != saved_fp,
+                        _ => false,
+                    };
+                    if !is_conflict {
+                        let _ = self.save_current_account(
+                            roots,
+                            Some(&current.manifest.name),
+                            Some(current),
+                        );
+                    } else if identity.is_present() {
+                        // 若属于另一已知账号则更新它；若为新账号则另存，绝不覆盖 current！
+                        if let Some(matched) = accounts.iter().find(|p| {
+                            identity.fingerprint.is_some()
+                                && p.manifest.fingerprint == identity.fingerprint
+                        }) {
+                            let _ = self.save_current_account(
+                                roots,
+                                Some(&matched.manifest.name),
+                                Some(matched),
+                            );
+                        } else {
+                            let _ = self.save_current_account(roots, None, None);
+                        }
+                    }
                 }
             }
         }
@@ -372,6 +410,72 @@ impl ToolStore {
         Ok(())
     }
 
+    /// 将已准备好的「标签 → 文件内容」导入为账号备份；不切换当前账号。
+    /// 供移植格式（transfer）与各工具原生格式导入共用，键必须是该工具的合法标签。
+    pub fn import_account_files(
+        &self,
+        roots: &Roots,
+        name: &str,
+        alias: Option<&str>,
+        identity: Option<&str>,
+        fingerprint: Option<&str>,
+        files: &std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Result<AccountProfile, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("导入账号名称不能为空".to_string());
+        }
+        if files.is_empty() {
+            return Err("导入数据为空：没有任何可备份的文件".to_string());
+        }
+        let mut unknown = files
+            .keys()
+            .filter(|tag| !self.tags.contains(&tag.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            unknown.sort();
+            return Err(format!(
+                "导入数据包含 {} 不支持的标签: {}",
+                self.display,
+                unknown.join(", ")
+            ));
+        }
+        let timestamp = now();
+        let manifest = AccountManifest {
+            version: MANIFEST_VERSION,
+            id: new_account_id(),
+            name: name.to_string(),
+            alias: alias
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_string),
+            phone: None,
+            identity: identity.map(str::to_string),
+            fingerprint: fingerprint.map(str::to_string),
+            created_at: timestamp,
+            updated_at: timestamp,
+            item_count: files.len(),
+        };
+        let directory = self.accounts_root(roots).join(&manifest.id);
+        let data = directory.join("data");
+        fs::create_dir_all(&data).map_err(|error| format!("创建导入目录失败: {error}"))?;
+        for (tag, bytes) in files {
+            let destination = data.join(tag);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            fs::write(&destination, bytes)
+                .map_err(|error| format!("写入导入文件 {tag} 失败: {error}"))?;
+        }
+        let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
+        fs::write(directory.join("manifest.json"), bytes).map_err(|error| error.to_string())?;
+        Ok(AccountProfile {
+            directory,
+            manifest,
+        })
+    }
+
     /// 清空登录状态，恢复到未登录的原始状态，方便重新登录。
     /// 清空前自动备份当前状态（与既有备份指纹一致时更新它而不是新建），
     /// 之后随时可以在列表中切回。返回自动备份的展示名；已是未登录状态
@@ -384,9 +488,10 @@ impl ToolStore {
         let backup_name = if has_files {
             let identity = (self.detect)(roots);
             let existing = identity.fingerprint.as_deref().and_then(|fingerprint| {
-                self.list_accounts(roots).ok()?.into_iter().find(|profile| {
-                    profile.manifest.fingerprint.as_deref() == Some(fingerprint)
-                })
+                self.list_accounts(roots)
+                    .ok()?
+                    .into_iter()
+                    .find(|profile| profile.manifest.fingerprint.as_deref() == Some(fingerprint))
             });
             // 更新已有备份时沿用其名称，避免自动改名
             let name = existing
@@ -489,7 +594,7 @@ pub(crate) fn now() -> u64 {
         .as_secs()
 }
 
-fn new_account_id() -> String {
+pub(crate) fn new_account_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -581,7 +686,9 @@ pub fn launch_cli_session(store: &ToolStore) -> Result<(), String> {
                 })
                 .collect(),
         };
-        let mut last_error = "未找到可用的终端程序，可设置环境变量 ZCODE_CLI_TERMINAL，或手动打开终端运行".to_string();
+        let mut last_error =
+            "未找到可用的终端程序，可设置环境变量 ZCODE_CLI_TERMINAL，或手动打开终端运行"
+                .to_string();
         for (program, style) in terminals {
             let mut command = Command::new(&program);
             match style {
@@ -614,6 +721,49 @@ pub fn launch_cli_session(store: &ToolStore) -> Result<(), String> {
             }
         }
         Err(last_error)
+    }
+}
+
+/// 在系统默认浏览器中打开指定 URL。
+pub fn open_url(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .map_err(|e| format!("打开浏览器失败: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("打开浏览器失败: {e}"))?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let browsers = ["xdg-open", "google-chrome", "chromium", "firefox"];
+        for browser in browsers {
+            if let Some(path) = find_in_path(browser) {
+                let mut cmd = Command::new(path);
+                cmd.arg(url);
+                use std::process::Stdio;
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    let _ = cmd.process_group(0);
+                }
+                if cmd.spawn().is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+        Err("未找到可用的浏览器打开链接".into())
     }
 }
 
@@ -740,7 +890,10 @@ mod tests {
         let mut identity = CliIdentity::default();
         assert_eq!(identity.default_name("Codex"), None);
         identity.fingerprint = Some("84ac0f0dabcdef".into());
-        assert_eq!(identity.default_name("Codex").as_deref(), Some("Codex84ac0f0d"));
+        assert_eq!(
+            identity.default_name("Codex").as_deref(),
+            Some("Codex84ac0f0d")
+        );
         identity.email = Some("someone@example.com".into());
         assert_eq!(identity.default_name("Codex").as_deref(), Some("someone"));
     }

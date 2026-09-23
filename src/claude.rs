@@ -9,10 +9,12 @@
 //! `~/.claude.json` 含大量本机项目状态，不参与快照；仅在其 `oauthAccount`
 //! 中尽力补齐邮箱显示。快照与切换机制由 `cli_accounts` 提供。
 
-use crate::cli_accounts::{read_json, short_digest, CliIdentity, ToolPath, ToolStore};
+use crate::cli_accounts::{
+    read_json, short_digest, CliIdentity, ImportResult, ToolPath, ToolStore,
+};
 use crate::Roots;
 use serde_json::Value;
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 static CLAUDE_PATHS: &[ToolPath] = &[
     ToolPath {
@@ -86,26 +88,10 @@ pub fn detect(roots: &Roots) -> CliIdentity {
 
     // settings.json：自定义端点 / API Token（常见的中转与第三方账号接入方式）
     if let Some(value) = read_json(&claude.join("settings.json")) {
-        let env = value.get("env");
-        let token = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
-            .iter()
-            .find_map(|key| {
-                env.and_then(|env| env.get(key))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|token| !token.is_empty())
-            })
-            .or_else(|| {
-                value
-                    .get("primaryApiKey")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|token| !token.is_empty())
-            });
-        if let Some(token) = token {
+        if let Some(token) = settings_auth_token(&value) {
             if identity.auth_type.is_none() {
-                let endpoint = env
-                    .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+                let endpoint = value
+                    .pointer("/env/ANTHROPIC_BASE_URL")
                     .and_then(Value::as_str)
                     .and_then(endpoint_host);
                 identity.auth_type = Some(match endpoint {
@@ -141,6 +127,102 @@ fn endpoint_host(url: &str) -> Option<&str> {
         .unwrap_or(url);
     let host = without_scheme.split('/').next()?;
     (!host.is_empty()).then_some(host)
+}
+
+/// settings.json 中的认证 Token：`env.ANTHROPIC_AUTH_TOKEN` /
+/// `ANTHROPIC_API_KEY` 或顶层 `primaryApiKey`。
+fn settings_auth_token(value: &Value) -> Option<&str> {
+    ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
+        .iter()
+        .find_map(|key| {
+            value
+                .pointer(&format!("/env/{key}"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+        })
+        .or_else(|| {
+            value
+                .get("primaryApiKey")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+        })
+}
+
+/// 原生格式导入：接受 `~/.claude/.credentials.json`（claudeAiOauth OAuth 凭据）
+/// 或 `~/.claude/settings.json`（env Token / primaryApiKey 端点认证）对象，
+/// 从另一台机器复制后直接粘贴或选择文件导入。导入只创建备份，不切换账号。
+pub fn import_native_text(
+    store: &ToolStore,
+    roots: &Roots,
+    text: &str,
+) -> Result<ImportResult, String> {
+    let value: Value = serde_json::from_str(text.trim())
+        .map_err(|error| format!("导入内容不是合法 JSON: {error}"))?;
+    if !value.is_object() {
+        return Err("Claude 导入内容必须是 JSON 对象（settings.json 或 .credentials.json）".into());
+    }
+
+    let mut identity = CliIdentity::default();
+    let tag = if value
+        .get("claudeAiOauth")
+        .is_some_and(|oauth| !oauth.is_null())
+    {
+        // OAuth 凭据文件
+        let oauth = &value["claudeAiOauth"];
+        identity.email = crate::identity::decode_jwt_identity(
+            oauth.get("accessToken").and_then(Value::as_str).unwrap_or_default(),
+        );
+        identity.fingerprint = oauth
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(|token| short_digest(token.as_bytes()));
+        identity.auth_type = Some("Claude OAuth".to_string());
+        "credentials"
+    } else if settings_auth_token(&value).is_some() {
+        // 端点认证 settings.json
+        let endpoint = value
+            .pointer("/env/ANTHROPIC_BASE_URL")
+            .and_then(Value::as_str)
+            .and_then(endpoint_host);
+        identity.auth_type = Some(match endpoint {
+            Some(host) => format!("API 端点 {host}"),
+            None => "API Key".to_string(),
+        });
+        identity.fingerprint = settings_auth_token(&value).map(|token| short_digest(token.as_bytes()));
+        "settings"
+    } else {
+        return Err(
+            "未识别到 Claude 登录数据：需要 claudeAiOauth（.credentials.json）或 env.ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY（settings.json）"
+                .into(),
+        );
+    };
+    if identity.fingerprint.is_none() {
+        identity.fingerprint = Some(short_digest(text.trim().as_bytes()));
+    }
+
+    let name = identity
+        .default_name("Claude")
+        .unwrap_or_else(|| "我的Claude账号".into());
+    let bytes = serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?;
+    let mut files = BTreeMap::new();
+    files.insert(tag.to_string(), bytes);
+    store
+        .import_account_files(
+            roots,
+            &name,
+            None,
+            Some(&identity.describe()),
+            identity.fingerprint.as_deref(),
+            &files,
+        )
+        .map(|_| ImportResult {
+            imported: 1,
+            skipped: 0,
+        })
 }
 
 #[cfg(test)]
@@ -259,11 +341,23 @@ mod tests {
     fn switch_swaps_credentials_and_settings() {
         let temp = TempDir::new().unwrap();
         let roots = roots(&temp);
-        write_file(&roots, "settings", r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"token-a"}}"#);
-        let account_a = STORE.save_current_account(&roots, Some("Claude A"), None).unwrap();
+        write_file(
+            &roots,
+            "settings",
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"token-a"}}"#,
+        );
+        let account_a = STORE
+            .save_current_account(&roots, Some("Claude A"), None)
+            .unwrap();
 
-        write_file(&roots, "settings", r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"token-b"}}"#);
-        let account_b = STORE.save_current_account(&roots, Some("Claude B"), None).unwrap();
+        write_file(
+            &roots,
+            "settings",
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"token-b"}}"#,
+        );
+        let account_b = STORE
+            .save_current_account(&roots, Some("Claude B"), None)
+            .unwrap();
 
         STORE.switch_account(&roots, &account_a).unwrap();
         assert_eq!(
@@ -283,7 +377,58 @@ mod tests {
             endpoint_host("https://open.bigmodel.cn/api/anthropic"),
             Some("open.bigmodel.cn")
         );
-        assert_eq!(endpoint_host("http://localhost:8080"), Some("localhost:8080"));
+        assert_eq!(
+            endpoint_host("http://localhost:8080"),
+            Some("localhost:8080")
+        );
         assert_eq!(endpoint_host(""), None);
+    }
+
+    #[test]
+    fn native_import_accepts_settings_and_credentials() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+
+        // settings.json（端点 Token 账号）
+        let result = import_native_text(
+            &STORE,
+            &roots,
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"tok-import","ANTHROPIC_BASE_URL":"https://open.bigmodel.cn/api/anthropic"}}"#,
+        )
+        .unwrap();
+        assert_eq!(result.imported, 1);
+        let accounts = STORE.list_accounts(&roots).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert!(accounts[0].manifest.name.starts_with("Claude"));
+        assert!(accounts[0]
+            .manifest
+            .identity
+            .as_deref()
+            .unwrap()
+            .contains("open.bigmodel.cn"));
+        // 存储按标签命名，切换时才能恢复
+        assert!(accounts[0].directory.join("data/settings").is_file());
+        assert!(!roots.user_profile.join(".claude").join("settings.json").exists());
+
+        // .credentials.json（OAuth 账号）
+        let access = jwt_with_claims(r#"{"email":"native@gmail.com"}"#);
+        let result = import_native_text(
+            &STORE,
+            &roots,
+            &format!(r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"rt-native"}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(result.imported, 1);
+        let oauth = STORE
+            .list_accounts(&roots)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.manifest.name == "native")
+            .expect("OAuth 账号应按邮箱前缀命名");
+        assert!(oauth.directory.join("data/credentials").is_file());
+
+        // 无凭据内容报错
+        assert!(import_native_text(&STORE, &roots, r#"{"model":"opus"}"#).is_err());
+        assert!(import_native_text(&STORE, &roots, "not json").is_err());
     }
 }
