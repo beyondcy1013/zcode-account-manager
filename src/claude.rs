@@ -54,6 +54,7 @@ pub static STORE: ToolStore = ToolStore {
     require_fingerprint: false,
     merge_restore: None,
     clear_file: None,
+    backup_problem: None,
     process_pattern: r"(^|/)claude( |$)",
 };
 

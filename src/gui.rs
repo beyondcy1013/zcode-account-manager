@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         {Arc, Mutex},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::identity::AccountIdentity;
@@ -189,6 +189,21 @@ impl ToolAccounts {
     }
 }
 
+/// 「刷新登录」后台观察状态：终端里重新登录后，等待本地出现新凭据指纹，
+/// 一旦检测到与发起时不同的指纹即把新凭据写回该备份。
+struct ReloginWatch {
+    /// TOOL_STORES 下标。
+    tool_index: usize,
+    /// 要写回的备份账号 id。
+    account_id: String,
+    /// 发起刷新时刻的凭据指纹（新指纹必须与其不同才会写回）。
+    old_fingerprint: Option<String>,
+    /// 截止时刻：超时仍未检测到新凭据则放弃自动写回。
+    deadline: Instant,
+    /// 账号显示名，用于状态提示。
+    name: String,
+}
+
 /// 自动发送后台任务的状态：工作线程写入，UI 每帧读取展示。
 #[derive(Default)]
 struct AutoSendState {
@@ -241,6 +256,8 @@ pub struct ZCodeApp {
     transfer_import: Option<TransferImportState>,
     /// 账号导出窗口（所有账号类型共用）。
     transfer_export: Option<TransferExportState>,
+    /// 「刷新登录」后的新凭据观察任务，同一时间只跟踪一个账号。
+    relogin_watch: Option<ReloginWatch>,
 }
 
 impl ZCodeApp {
@@ -298,6 +315,7 @@ impl ZCodeApp {
             gemini_login: None,
             transfer_import: None,
             transfer_export: None,
+            relogin_watch: None,
         };
         app.refresh();
         // 启动后立即后台补齐慢速信息（ZCode 进程状态、当前账号标识）
@@ -566,6 +584,105 @@ impl ZCodeApp {
                 self.set_error(error);
                 false
             }
+        }
+    }
+
+    /// 行内「刷新登录」：若目标不是当前账号先切换过去（含自动备份与回滚），
+    /// 再打开终端让用户重新登录；随后后台观察凭据指纹，出现新凭据时自动写回该备份。
+    /// 目标备份本身异常（如缺凭据，无法切换恢复）时改为先备份当前登录并清除凭据，
+    /// 让用户在终端重新登录后由观察任务把新凭据写回该备份。
+    fn start_tool_relogin(&mut self, tool_index: usize, id: &str) {
+        let Some(store) = self.tools.get(tool_index).map(|tool| tool.store) else {
+            return;
+        };
+        let Some(profile) = self.tools[tool_index].profile(id) else {
+            self.set_error("目标账号不存在");
+            return;
+        };
+        let name = profile.manifest.display_name().to_string();
+        let is_active = self.tools[tool_index].active_id.as_deref() == Some(id);
+        let mut cleared_for_broken_backup = false;
+        if !is_active {
+            if store.account_problem(&profile).is_some() {
+                // 备份本身不完整（如缺少登录凭据），switch_account 会被拒绝；
+                // 改为备份当前登录状态后清除凭据，留出干净环境重新登录。
+                if let Err(error) = store.clear_account(&self.roots) {
+                    self.set_error(error);
+                    return;
+                }
+                cleared_for_broken_backup = true;
+            } else if let Err(error) = store.switch_account(&self.roots, &profile) {
+                self.set_error(error);
+                return;
+            }
+            self.refresh();
+        }
+        if let Err(error) = cli_accounts::launch_cli_session(store) {
+            self.set_error(error);
+            return;
+        }
+        let fingerprint = (store.detect)(&self.roots).fingerprint;
+        self.relogin_watch = Some(ReloginWatch {
+            tool_index,
+            account_id: id.to_string(),
+            old_fingerprint: fingerprint,
+            deadline: Instant::now() + Duration::from_secs(300),
+            name: name.clone(),
+        });
+        if cleared_for_broken_backup {
+            self.set_ok(format!(
+                "备份「{name}」缺少凭据，已备份当前登录并清除；请在终端完成 {} 登录，新凭据将自动更新到该备份",
+                store.display
+            ));
+        } else {
+            self.set_ok(format!(
+                "已在终端打开 {}，请完成登录；检测到新凭据后将自动更新备份「{name}」",
+                store.display
+            ));
+        }
+    }
+
+    /// 轮询「刷新登录」观察：本地出现与发起时不同的新凭据指纹后，把当前
+    /// 登录状态写回该备份；超过截止时间仍未变化则放弃并提示手动更新。
+    /// detect 只读本地文件代价低，跟随 2 秒一次的后台 repaint 检查即可。
+    fn poll_relogin_watch(&mut self) {
+        let Some(watch) = self.relogin_watch.as_ref() else {
+            return;
+        };
+        let Some(store) = self.tools.get(watch.tool_index).map(|tool| tool.store) else {
+            self.relogin_watch = None;
+            return;
+        };
+        let fingerprint = (store.detect)(&self.roots).fingerprint;
+        let changed = fingerprint
+            .as_deref()
+            .is_some_and(|new| watch.old_fingerprint.as_deref() != Some(new));
+        if changed {
+            let watch = self.relogin_watch.take().unwrap();
+            match self.tools[watch.tool_index].profile(&watch.account_id) {
+                Some(profile) => match store.save_current_account(
+                    &self.roots,
+                    Some(&profile.manifest.name),
+                    Some(&profile),
+                ) {
+                    Ok(_) => {
+                        self.refresh();
+                        self.set_ok(format!("已用新凭据更新备份「{}」", watch.name));
+                    }
+                    Err(error) => self.set_error(error),
+                },
+                None => {
+                    self.set_error(format!("备份「{}」已不存在，无法写回新凭据", watch.name))
+                }
+            }
+            return;
+        }
+        if Instant::now() >= watch.deadline {
+            let watch = self.relogin_watch.take().unwrap();
+            self.set_ok(format!(
+                "等待登录超时：如已完成登录，请点击「更新」手动写回「{}」",
+                watch.name
+            ));
         }
     }
 
@@ -1253,6 +1370,9 @@ impl ZCodeApp {
                             self.tools[tool_index].active_id.as_deref() == Some(id.as_str());
                         if is_active {
                             ui.colored_label(Color32::from_rgb(32, 132, 88), "当前");
+                        } else if let Some(problem) = store.account_problem(&profile) {
+                            ui.colored_label(Color32::from_rgb(180, 48, 48), "异常")
+                                .on_hover_text(problem);
                         } else {
                             ui.label("已备份");
                         }
@@ -1291,6 +1411,15 @@ impl ZCodeApp {
                             {
                                 self.confirm =
                                     Some(ConfirmAction::ToolSwitch(tool_index, id.clone()));
+                            }
+                            if ui
+                                .button("刷新登录")
+                                .on_hover_text(
+                                    "打开终端重新登录该账号；非当前账号会先切换过去，检测到新凭据后自动更新此备份",
+                                )
+                                .clicked()
+                            {
+                                self.start_tool_relogin(tool_index, &id);
                             }
                             if ui
                                 .button("编辑")
@@ -2387,6 +2516,8 @@ impl eframe::App for ZCodeApp {
         let ctx = ui.ctx().clone();
         // 后台慢速刷新完成时取回结果，保证展示的账号状态为最新
         self.apply_refresh_outcome();
+        // 「刷新登录」观察：检测到新凭据指纹时自动写回备份（跟随 2 秒 repaint）
+        self.poll_relogin_watch();
         // 点击窗口关闭按钮 = 隐藏到系统托盘；仅托盘菜单「退出」会真正退出
         if ctx.input(|input| input.viewport().close_requested())
             && !tray::EXIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
@@ -2701,6 +2832,7 @@ mod tests {
             gemini_login: None,
             transfer_import: None,
             transfer_export: None,
+            relogin_watch: None,
         };
 
         // 1. 初次检测到 ZCode 账号：自动填入默认名称

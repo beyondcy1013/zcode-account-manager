@@ -603,6 +603,7 @@ mod tests {
             require_fingerprint: false,
             merge_restore: None,
             clear_file: None,
+            backup_problem: None,
             process_pattern: "codex",
         }
     }

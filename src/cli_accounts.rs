@@ -72,6 +72,8 @@ pub struct ToolStore {
     pub merge_restore: Option<MergeRestoreHook>,
     /// 定制清空：见 `ClearFileHook`。未设置时删除文件。
     pub clear_file: Option<ClearFileHook>,
+    /// 备份健康检查：参数为备份的 data 目录，返回 Some(中文错误描述) 表示该备份有问题。
+    pub backup_problem: Option<fn(&Path) -> Option<String>>,
     /// 检测运行中会话的 pgrep -f 模式（仅类 Unix 平台使用）。
     pub process_pattern: &'static str,
 }
@@ -327,7 +329,7 @@ impl ToolStore {
 
     /// 定位快照中某标签的源文件：优先 `data/<tag>`，不存在时回退
     /// `data/<该 tag 的 relative 路径>` 以兼容旧版按文件名存放的布局。
-    fn snapshot_source(&self, data: &Path, tag: &str) -> Option<PathBuf> {
+    pub(crate) fn snapshot_source(&self, data: &Path, tag: &str) -> Option<PathBuf> {
         let primary = data.join(tag);
         if primary.exists() {
             return Some(primary);
@@ -464,6 +466,16 @@ impl ToolStore {
         }
         set_active_account(self, roots, Some(&target.manifest.id))?;
         Ok(())
+    }
+
+    /// 检查备份是否完整可用：data 目录缺失，或工具自定义检查
+    /// （`backup_problem`）发现问题时返回中文错误描述；无问题返回 None。
+    pub fn account_problem(&self, profile: &AccountProfile) -> Option<String> {
+        let data = profile.directory.join("data");
+        if !data.is_dir() {
+            return Some("备份不完整：缺少数据目录".to_string());
+        }
+        self.backup_problem.and_then(|check| check(&data))
     }
 
     pub fn delete_account(&self, roots: &Roots, profile: &AccountProfile) -> Result<(), String> {
@@ -901,6 +913,7 @@ mod tests {
         require_fingerprint: false,
         merge_restore: None,
         clear_file: None,
+        backup_problem: None,
         process_pattern: r"(^|/)testcli( |$)",
     };
 

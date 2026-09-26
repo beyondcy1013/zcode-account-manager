@@ -279,6 +279,25 @@ fn merge_settings(
         .map_err(|error| error.to_string())
 }
 
+/// `backup_problem` 钩子：备份快照的 settings（data/settings 或旧布局
+/// data/settings.json）缺少 CODEBUDDY_AUTH_TOKEN 时报告异常，提示重新登录刷新。
+fn settings_backup_problem(data: &std::path::Path) -> Option<String> {
+    let value = STORE
+        .snapshot_source(data, "settings")
+        .and_then(|source| fs::read(source).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let token_ok = value
+        .as_ref()
+        .map(|value| {
+            let probe = json!({ "env": value.get("env").cloned().unwrap_or(Value::Null) });
+            matches!(token_from_env(&probe), Ok(Some(_)))
+        })
+        .unwrap_or(false);
+    (!token_ok).then(|| {
+        "备份缺少登录凭据（CODEBUDDY_AUTH_TOKEN），请用「刷新登录」重新获取".to_string()
+    })
+}
+
 /// `clear_file` 钩子：只移除 env 下的认证键，保留其余配置；文件本身保留。
 fn clear_settings(_tag: &str, current: &[u8]) -> Result<Option<Vec<u8>>, String> {
     let mut value: Value = serde_json::from_slice(current)
@@ -338,6 +357,7 @@ pub static STORE: ToolStore = ToolStore {
     require_fingerprint: true,
     merge_restore: Some(merge_settings),
     clear_file: Some(clear_settings),
+    backup_problem: Some(settings_backup_problem),
     process_pattern: r"(^|/)codebuddy( |$)",
 };
 
@@ -370,6 +390,7 @@ mod tests {
             require_fingerprint: false,
             merge_restore: None,
             clear_file: None,
+            backup_problem: None,
             process_pattern: "codebuddy",
         }
     }
@@ -696,5 +717,55 @@ mod tests {
         let second = STORE.clear_account(&roots).unwrap();
         assert_eq!(second, None);
         assert_eq!(STORE.list_accounts(&roots).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn account_problem_reports_missing_credentials() {
+        let temp = TempDir::new().unwrap();
+        let roots = roots(&temp);
+        // 快照 settings 有 token → 无问题
+        write_backup(
+            &roots,
+            "ok-acc",
+            &[(
+                "settings",
+                &json!({"env": {"CODEBUDDY_AUTH_TOKEN": "token-ok"}}),
+            )],
+        );
+        // 快照 settings 无 token → 异常
+        write_backup(
+            &roots,
+            "no-token",
+            &[("settings", &json!({"model": "codebuddy-x"}))],
+        );
+        // 缺 data 目录的损坏备份 → 异常
+        let broken = STORE.accounts_root(&roots).join("broken-acc");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(
+            broken.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "id": "broken-acc",
+                "name": "坏备份",
+                "created_at": 1,
+                "updated_at": 1,
+                "item_count": 0,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let accounts = STORE.list_accounts(&roots).unwrap();
+        let by_id = |id: &str| accounts.iter().find(|p| p.manifest.id == id).unwrap();
+        assert_eq!(STORE.account_problem(by_id("ok-acc")), None);
+        let problem = STORE.account_problem(by_id("no-token")).unwrap();
+        assert!(
+            problem.contains("CODEBUDDY_AUTH_TOKEN"),
+            "应说明缺少登录凭据: {problem}"
+        );
+        assert_eq!(
+            STORE.account_problem(by_id("broken-acc")).as_deref(),
+            Some("备份不完整：缺少数据目录")
+        );
     }
 }
