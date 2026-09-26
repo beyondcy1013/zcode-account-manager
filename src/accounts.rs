@@ -257,7 +257,7 @@ fn restore_data(roots: &Roots, data: &Path) -> Result<(), String> {
     for tag in FULL_TAGS {
         // 旧版本快照里没有后期新增的配置项，此时保留本机现状而不是清空；
         // 其余项目必须先清理，避免上一账号的残留和新账号混在一起。
-        if PRESERVE_IF_ABSENT_TAGS.contains(&tag) && !data.join(tag).exists() {
+        if PRESERVE_IF_ABSENT_TAGS.contains(tag) && !data.join(tag).exists() {
             continue;
         }
         let destination = roots.resolve(candidate_by_tag(tag));

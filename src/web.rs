@@ -70,7 +70,7 @@ fn handle_connection(mut stream: TcpStream, roots: &Roots) -> Result<(), String>
     reader
         .read_line(&mut request_line)
         .map_err(|e| e.to_string())?;
-    let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         return Ok(());
     }

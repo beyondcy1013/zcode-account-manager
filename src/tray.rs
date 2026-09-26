@@ -321,17 +321,28 @@ mod imp {
     };
     use x11rb::rust_connection::RustConnection;
 
+    /// 待重采样绘制的源图标：RGBA8 像素与其宽高。
+    struct SourceIcon {
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+    }
+
     /// XEmbed 托盘线程；面板的托盘区未提供 StatusNotifier watcher，但保留了
     /// legacy XEmbed 托盘管理器：创建一个小窗口按系统托盘协议请求嵌入。
     pub fn spawn(ctx: egui::Context) -> Result<(), String> {
-        let icon = image::load_from_memory(include_bytes!("../assets/icon-tray.png"))
+        let image = image::load_from_memory(include_bytes!("../assets/icon-tray.png"))
             .expect("内置托盘图标必须是可解码的 PNG")
             .into_rgba8();
-        let (icon_w, icon_h) = (icon.width(), icon.height());
+        let icon = SourceIcon {
+            width: image.width(),
+            height: image.height(),
+            rgba: image.into_vec(),
+        };
         std::thread::Builder::new()
             .name("xembed-tray".into())
             .spawn(move || {
-                if let Err(error) = run_tray(ctx, icon.into_vec(), icon_w, icon_h) {
+                if let Err(error) = run_tray(ctx, icon) {
                     eprintln!("托盘图标不可用：{error}");
                 }
             })
@@ -339,7 +350,7 @@ mod imp {
         Ok(())
     }
 
-    fn run_tray(ctx: egui::Context, icon: Vec<u8>, icon_w: u32, icon_h: u32) -> Result<(), String> {
+    fn run_tray(ctx: egui::Context, icon: SourceIcon) -> Result<(), String> {
         fn xerr<E: std::fmt::Display>(error: E) -> String {
             error.to_string()
         }
@@ -427,17 +438,8 @@ mod imp {
                     let size = ev.width.min(ev.height) as u32;
                     if size > 0 && size != current_size {
                         current_size = size;
-                        draw_icon(
-                            &conn,
-                            screen.root_depth,
-                            window,
-                            gc,
-                            &icon,
-                            icon_w,
-                            icon_h,
-                            size,
-                        )
-                        .map_err(xerr)?;
+                        draw_icon(&conn, screen.root_depth, window, gc, &icon, size)
+                            .map_err(xerr)?;
                     }
                 }
                 x11rb::protocol::Event::ButtonPress(ev) if ev.event == window => {
@@ -456,21 +458,19 @@ mod imp {
         depth: u8,
         window: Window,
         gc: u32,
-        icon: &[u8],
-        icon_w: u32,
-        icon_h: u32,
+        icon: &SourceIcon,
         size: u32,
     ) -> Result<(), std::string::String> {
         let mut pixels = Vec::with_capacity((size * size * 4) as usize);
         for y in 0..size {
-            let sy = (y * icon_h / size) as usize;
+            let sy = (y * icon.height / size) as usize;
             for x in 0..size {
-                let sx = (x * icon_w / size) as usize;
-                let i = (sy * icon_w as usize + sx) * 4;
-                let a = icon[i + 3] as u16;
-                let r = (icon[i] as u16 * a / 255) as u8;
-                let g = (icon[i + 1] as u16 * a / 255) as u8;
-                let b = (icon[i + 2] as u16 * a / 255) as u8;
+                let sx = (x * icon.width / size) as usize;
+                let i = (sy * icon.width as usize + sx) * 4;
+                let a = icon.rgba[i + 3] as u16;
+                let r = (icon.rgba[i] as u16 * a / 255) as u8;
+                let g = (icon.rgba[i + 1] as u16 * a / 255) as u8;
+                let b = (icon.rgba[i + 2] as u16 * a / 255) as u8;
                 pixels.push(b);
                 pixels.push(g);
                 pixels.push(r);

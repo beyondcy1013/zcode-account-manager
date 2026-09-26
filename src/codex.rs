@@ -4,6 +4,7 @@
 //! - `auth.json`：ChatGPT OAuth 登录（`tokens.id_token/refresh_token`）或
 //!   API Key（`OPENAI_API_KEY`），两者都可能是当前生效的认证方式；
 //! - `config.toml`：用户配置（模型、Provider 等），切换账号时保留本机现状。
+//!
 //! 快照与切换机制由 `cli_accounts` 提供。
 
 use crate::cli_accounts::{

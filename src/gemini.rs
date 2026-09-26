@@ -3,6 +3,7 @@
 //! Gemini CLI 已并入 Antigravity CLI，两者共用 `~/.gemini` 目录：
 //! - 旧版 Gemini CLI：`~/.gemini/oauth_creds.json` 等文件；
 //! - Antigravity CLI：`~/.gemini/antigravity-cli/antigravity-oauth-token` 等。
+//!
 //! 两者都纳入快照与识别，账号识别完全基于本地文件（OAuth token、账号缓存、
 //! antigravity 日志中的认证记录）。快照与切换机制由 `cli_accounts` 提供。
 
@@ -335,7 +336,7 @@ fn agy_log_auth(agy_dir: &Path) -> Option<AgyLogAuth> {
         })
         .collect();
     // 最新日志优先：账号邮箱取最近一次认证成功的记录
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|entry| Reverse(entry.0));
     for (_, path) in files {
         let Ok(content) = fs::read_to_string(path) else {
             continue;
@@ -555,6 +556,7 @@ fn format_rfc3339_timestamp(secs: u64) -> String {
 }
 
 use std::{
+    cmp::Reverse,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };

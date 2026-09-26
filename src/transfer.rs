@@ -665,7 +665,7 @@ mod tests {
         );
 
         // 指定 id 只导出该账号
-        let single = export_tool_accounts(&tool_store, &root, &[saved.manifest.id.clone()]).unwrap();
+        let single = export_tool_accounts(&tool_store, &root, &[saved.manifest.id]).unwrap();
         let single_value: Value = serde_json::from_str(&single).unwrap();
         assert_eq!(single_value["accounts"].as_array().unwrap().len(), 1);
     }

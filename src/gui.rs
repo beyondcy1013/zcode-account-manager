@@ -725,7 +725,7 @@ impl ZCodeApp {
                         Ok(()) => {
                             me.refresh();
                             // 当前账号标识较慢（需调用 zcode CLI），放后台刷新
-                            me.begin_refresh(&ctx);
+                            me.begin_refresh(ctx);
                             me.set_ok(format!(
                                 "已切换到 {}；正在后台刷新当前账号标识……",
                                 profile.manifest.display_name()
@@ -740,7 +740,7 @@ impl ZCodeApp {
                 });
             }
             ConfirmAction::Save { name } => {
-                self.run_with_zcode_closed("保存", |me| me.do_save(name, &ctx));
+                self.run_with_zcode_closed("保存", |me| me.do_save(name, ctx));
             }
             ConfirmAction::Update(id) => {
                 self.run_with_zcode_closed("更新备份", |me| me.do_update(&id));
@@ -1973,7 +1973,6 @@ impl ZCodeApp {
                     ));
                     self.refresh();
                     self.begin_refresh(ctx);
-                    return;
                 }
                 Err(e) => {
                     login_state.error = Some(format!("登录失败: {e}"));
