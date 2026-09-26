@@ -88,6 +88,9 @@ pub static STORE: ToolStore = ToolStore {
     clear_tags: GEMINI_CLEAR_TAGS,
     launch_commands: &["agy", "gemini"],
     detect,
+    require_fingerprint: false,
+    merge_restore: None,
+    clear_file: None,
     process_pattern: r"(^|/)(gemini|agy)( |$)",
 };
 

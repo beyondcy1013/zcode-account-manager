@@ -600,6 +600,9 @@ mod tests {
             clear_tags: &["auth"],
             launch_commands: &[],
             detect: |_| CliIdentity::default(),
+            require_fingerprint: false,
+            merge_restore: None,
+            clear_file: None,
             process_pattern: "codex",
         }
     }

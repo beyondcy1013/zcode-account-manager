@@ -27,6 +27,12 @@ pub struct ImportResult {
     pub skipped: usize,
 }
 
+/// 定制恢复钩子：参数 (tag, 当前文件内容, 快照文件内容)，返回要写入的内容（None=删除）。
+pub type MergeRestoreHook =
+    fn(&str, Option<&[u8]>, Option<&[u8]>) -> Result<Option<Vec<u8>>, String>;
+/// 定制清空钩子：参数 (tag, 当前文件内容)，返回清除凭据后的内容（None=删除文件）。
+pub type ClearFileHook = fn(&str, &[u8]) -> Result<Option<Vec<u8>>, String>;
+
 /// CLI 工具登录状态涉及的文件，相对路径基于该工具的 `base_dir`。
 pub struct ToolPath {
     pub tag: &'static str,
@@ -60,6 +66,12 @@ pub struct ToolStore {
     pub launch_commands: &'static [&'static str],
     /// 从本地文件识别当前账号。
     pub detect: fn(&Roots) -> CliIdentity,
+    /// 为 true 时，detect 未得到指纹（没有真实凭据）就拒绝保存备份。
+    pub require_fingerprint: bool,
+    /// 定制恢复：见 `MergeRestoreHook`。未设置时整文件删除后复制。
+    pub merge_restore: Option<MergeRestoreHook>,
+    /// 定制清空：见 `ClearFileHook`。未设置时删除文件。
+    pub clear_file: Option<ClearFileHook>,
     /// 检测运行中会话的 pgrep -f 模式（仅类 Unix 平台使用）。
     pub process_pattern: &'static str,
 }
@@ -239,6 +251,9 @@ impl ToolStore {
         existing: Option<&AccountProfile>,
     ) -> Result<AccountProfile, String> {
         let identity = (self.detect)(roots);
+        if self.require_fingerprint && identity.fingerprint.is_none() {
+            return Err(format!("未检测到 {} 登录凭据，无法保存账号", self.display));
+        }
         let name = name
             .map(str::trim)
             .filter(|name| !name.is_empty())
@@ -310,11 +325,32 @@ impl ToolStore {
         Ok(profiles)
     }
 
-    fn restore_data(&self, roots: &Roots, data: &Path) -> Result<(), String> {
+    /// 定位快照中某标签的源文件：优先 `data/<tag>`，不存在时回退
+    /// `data/<该 tag 的 relative 路径>` 以兼容旧版按文件名存放的布局。
+    fn snapshot_source(&self, data: &Path, tag: &str) -> Option<PathBuf> {
+        let primary = data.join(tag);
+        if primary.exists() {
+            return Some(primary);
+        }
+        let entry = self.paths.iter().find(|entry| entry.tag == tag)?;
+        let legacy = entry
+            .relative
+            .split('/')
+            .fold(data.to_path_buf(), |path, part| path.join(part));
+        legacy.exists().then_some(legacy)
+    }
+
+    /// 恢复快照数据。`exact` 为 true 时忽略 `merge_restore`，按通用逻辑
+    /// 逐 tag 删除后整文件复制（回滚 safety 快照时使用，保证逐字节还原）。
+    fn restore_data(&self, roots: &Roots, data: &Path, exact: bool) -> Result<(), String> {
+        let merge = (!exact).then_some(self.merge_restore).flatten();
         for tag in self.tags {
+            if merge.is_some() {
+                continue;
+            }
             // 配置类项目在旧快照缺失时保留本机现状；其余项目必须先清理，
             // 避免上一账号的残留和新账号混在一起。
-            if self.preserve_if_absent.contains(&tag) && !data.join(tag).exists() {
+            if self.preserve_if_absent.contains(tag) && self.snapshot_source(data, tag).is_none() {
                 continue;
             }
             let destination = self.resolve(roots, tag);
@@ -324,10 +360,38 @@ impl ToolStore {
             }
         }
         for tag in self.tags {
-            let source = data.join(tag);
-            if source.exists() {
+            if merge.is_some() {
+                continue;
+            }
+            if let Some(source) = self.snapshot_source(data, tag) {
                 copy_path(&source, &self.resolve(roots, tag))
                     .map_err(|error| format!("恢复 {tag} 失败: {error}"))?;
+            }
+        }
+        if let Some(merge) = merge {
+            for tag in self.tags {
+                let destination = self.resolve(roots, tag);
+                let current = fs::read(&destination).ok();
+                let snapshot = self
+                    .snapshot_source(data, tag)
+                    .and_then(|source| fs::read(source).ok());
+                match merge(tag, current.as_deref(), snapshot.as_deref())
+                    .map_err(|error| format!("恢复 {tag} 失败: {error}"))?
+                {
+                    Some(bytes) => {
+                        if let Some(parent) = destination.parent() {
+                            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                        }
+                        fs::write(&destination, bytes)
+                            .map_err(|error| format!("恢复 {tag} 失败: {error}"))?;
+                    }
+                    None => {
+                        if destination.exists() {
+                            remove_path(&destination)
+                                .map_err(|error| format!("清理当前 {tag} 失败: {error}"))?;
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -388,8 +452,8 @@ impl ToolStore {
         };
         self.snapshot_to(roots, &safety_root, &safety_manifest)?;
 
-        if let Err(error) = self.restore_data(roots, &data) {
-            let rollback = self.restore_data(roots, &safety_root.join("data"));
+        if let Err(error) = self.restore_data(roots, &data, false) {
+            let rollback = self.restore_data(roots, &safety_root.join("data"), true);
             return match rollback {
                 Ok(()) => Err(format!("切换失败，已恢复原账号: {error}")),
                 Err(rollback_error) => Err(format!(
@@ -487,25 +551,49 @@ impl ToolStore {
             .any(|tag| self.resolve(roots, tag).exists());
         let backup_name = if has_files {
             let identity = (self.detect)(roots);
-            let existing = identity.fingerprint.as_deref().and_then(|fingerprint| {
-                self.list_accounts(roots)
-                    .ok()?
-                    .into_iter()
-                    .find(|profile| profile.manifest.fingerprint.as_deref() == Some(fingerprint))
-            });
-            // 更新已有备份时沿用其名称，避免自动改名
-            let name = existing
-                .as_ref()
-                .map(|profile| profile.manifest.name.as_str());
-            let profile = self.save_current_account(roots, name, existing.as_ref())?;
-            Some(profile.manifest.display_name().to_string())
+            if self.require_fingerprint && identity.fingerprint.is_none() {
+                // 没有真实凭据时不自动备份，直接清除
+                None
+            } else {
+                let existing = identity.fingerprint.as_deref().and_then(|fingerprint| {
+                    self.list_accounts(roots)
+                        .ok()?
+                        .into_iter()
+                        .find(|profile| {
+                            profile.manifest.fingerprint.as_deref() == Some(fingerprint)
+                        })
+                });
+                // 更新已有备份时沿用其名称，避免自动改名
+                let name = existing
+                    .as_ref()
+                    .map(|profile| profile.manifest.name.as_str());
+                let profile = self.save_current_account(roots, name, existing.as_ref())?;
+                Some(profile.manifest.display_name().to_string())
+            }
         } else {
             None
         };
         let mut removed = false;
         for tag in self.clear_tags {
             let path = self.resolve(roots, tag);
-            if path.exists() {
+            if let Some(clear) = self.clear_file {
+                let Ok(current) = fs::read(&path) else {
+                    continue;
+                };
+                match clear(tag, &current).map_err(|error| format!("清除 {tag} 失败: {error}"))? {
+                    Some(bytes) => {
+                        if bytes != current {
+                            fs::write(&path, bytes)
+                                .map_err(|error| format!("清除 {tag} 失败: {error}"))?;
+                            removed = true;
+                        }
+                    }
+                    None => {
+                        remove_path(&path).map_err(|error| format!("清除 {tag} 失败: {error}"))?;
+                        removed = true;
+                    }
+                }
+            } else if path.exists() {
                 remove_path(&path).map_err(|error| format!("清除 {tag} 失败: {error}"))?;
                 removed = true;
             }
@@ -565,7 +653,7 @@ impl ToolStore {
     /// 供其他模块的单元测试验证配置保留语义。
     #[cfg(test)]
     pub fn restore_data_public_for_test(&self, roots: &Roots, data: &Path) -> Result<(), String> {
-        self.restore_data(roots, data)
+        self.restore_data(roots, data, false)
     }
 }
 
@@ -810,6 +898,9 @@ mod tests {
         clear_tags: TEST_CLEAR,
         launch_commands: &["testcli"],
         detect: |_| CliIdentity::default(),
+        require_fingerprint: false,
+        merge_restore: None,
+        clear_file: None,
         process_pattern: r"(^|/)testcli( |$)",
     };
 
@@ -867,7 +958,7 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         fs::write(data.join("creds"), b"other-login").unwrap();
         fs::write(data.join("cfg"), br#"{"keep":"theirs"}"#).unwrap();
-        TEST_STORE.restore_data(&roots, &data).unwrap();
+        TEST_STORE.restore_data(&roots, &data, false).unwrap();
         assert_eq!(fs::read(&cfg).unwrap(), br#"{"keep":"theirs"}"#);
     }
 

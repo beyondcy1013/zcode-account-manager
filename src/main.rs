@@ -1244,7 +1244,12 @@ fn run() -> Result<(), String> {
                     .default_name()
                     .unwrap_or_else(|| "（未检测到登录状态）".into())
             );
-            for store in [&gemini::STORE, &codex::STORE, &claude::STORE] {
+            for store in [
+                &gemini::STORE,
+                &codex::STORE,
+                &claude::STORE,
+                &codebuddy::STORE,
+            ] {
                 println!(
                     "{} 账号: {}",
                     store.display,

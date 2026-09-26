@@ -47,6 +47,9 @@ pub static STORE: ToolStore = ToolStore {
     clear_tags: CODEX_CLEAR_TAGS,
     launch_commands: &["codex"],
     detect,
+    require_fingerprint: false,
+    merge_restore: None,
+    clear_file: None,
     process_pattern: r"(^|/)codex( |$)",
 };
 
