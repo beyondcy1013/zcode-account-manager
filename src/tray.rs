@@ -358,6 +358,33 @@ mod imp {
         let screen = &conn.setup().roots[screen_num];
         let root = screen.root;
 
+        // 托盘管理器可能尚未就绪（登录竞争）或暂时无响应，多次尝试后才放弃；
+        // 任何一轮失败都必须销毁本轮窗口，绝不留下无名的游离窗口。
+        let mut last_error = String::new();
+        for _ in 0..5 {
+            match dock_to_tray(&conn, screen, root, screen_num) {
+                Ok(window) => {
+                    return tray_event_loop(&conn, &ctx, root, screen.root_depth, window, &icon)
+                }
+                Err(error) => {
+                    last_error = error;
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    /// 创建托盘图标窗口并请求嵌入；返回“已被托盘收养”的窗口。
+    fn dock_to_tray(
+        conn: &RustConnection,
+        screen: &x11rb::protocol::xproto::Screen,
+        root: Window,
+        screen_num: usize,
+    ) -> Result<Window, String> {
+        fn xerr<E: std::fmt::Display>(error: E) -> String {
+            error.to_string()
+        }
         // 找托盘管理器（面板的 legacy systray）
         let sel_atom = conn
             .intern_atom(false, format!("_NET_SYSTEM_TRAY_S{screen_num}").as_bytes())
@@ -415,22 +442,181 @@ mod imp {
             &[0u8, 0, 0, 0, 1, 0, 0, 0],
         )
         .map_err(xerr)?;
-        conn.map_window(window).map_err(xerr)?;
+        set_window_identity(conn, window)?;
+        // 注意：dock 成功前绝不能映射窗口——窗口管理器会立即把已映射的
+        // 顶层窗口当普通应用接管（加边框、进任务栏），一旦托盘没有收养
+        // 就会残留为任务栏里的“无标题窗口”。收养后由托盘负责映射。
         conn.flush().map_err(xerr)?;
 
-        // 请求嵌入托盘：向管理器发送 SYSTEM_TRAY_REQUEST_DOCK
-        // data[0] 时间戳用 0（面板接受），data[2] 为要嵌入的窗口
-        let data = ClientMessageData::from([0u32, SYSTEM_TRAY_REQUEST_DOCK as u32, window, 0, 0]);
-        let event = ClientMessageEvent::new(32, manager, sel_atom, data);
+        // 请求嵌入托盘：按 System Tray 规范，消息类型必须是 _NET_SYSTEM_TRAY_OPCODE
+        // （不是 selection 原子），data = [服务器时间戳, SYSTEM_TRAY_REQUEST_DOCK, 窗口]。
+        // 实测 xfce 的托盘插件对消息类型不符的请求直接忽略。
+        let opcode_atom = conn
+            .intern_atom(false, b"_NET_SYSTEM_TRAY_OPCODE")
+            .map_err(xerr)?
+            .reply()
+            .map_err(xerr)?
+            .atom;
+        let timestamp = server_timestamp(conn, root)?;
+        let data = ClientMessageData::from([
+            timestamp,
+            SYSTEM_TRAY_REQUEST_DOCK as u32,
+            window,
+            0,
+            0,
+        ]);
+        let event = ClientMessageEvent::new(32, manager, opcode_atom, data);
         conn.send_event(false, manager, EventMask::NO_EVENT, event)
             .map_err(xerr)?;
         conn.flush().map_err(xerr)?;
 
-        // 事件循环：尺寸变化时重绘图标，点击时唤起主窗口
+        // 轮询等待收养确认（ReparentNotify 且新父窗口不是根窗口）。
+        // 管理器无响应（占着 selection 但不处理 dock，见过 libsystray 挂死的情况）
+        // 时超时销毁窗口重试，避免残留无名窗口。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            while let Some(event) = conn.poll_for_event().map_err(xerr)? {
+                if let x11rb::protocol::Event::ReparentNotify(ev) = event {
+                    if ev.window == window && ev.parent != root {
+                        return Ok(window);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        conn.destroy_window(window).map_err(xerr)?;
+        conn.flush().map_err(xerr)?;
+        Err("托盘管理器 4 秒内未收养图标（可能无响应）".into())
+    }
+
+    /// 设置 WM_CLASS 与窗口标题：托盘/任务栏据此显示应用名，而不是“无标题”。
+    fn set_window_identity(conn: &RustConnection, window: Window) -> Result<(), String> {
+        fn xerr<E: std::fmt::Display>(error: E) -> String {
+            error.to_string()
+        }
+        fn atom(conn: &RustConnection, name: &[u8]) -> Result<u32, String> {
+            Ok(conn
+                .intern_atom(false, name)
+                .map_err(|error| error.to_string())?
+                .reply()
+                .map_err(|error| error.to_string())?
+                .atom)
+        }
+        let wm_class = atom(conn, b"WM_CLASS")?;
+        let wm_name = atom(conn, b"WM_NAME")?;
+        let net_wm_name = atom(conn, b"_NET_WM_NAME")?;
+        let string_type = atom(conn, b"STRING")?;
+        let utf8_string = atom(conn, b"UTF8_STRING")?;
+        // WM_CLASS = "实例名\0类名\0"，8 位 STRING
+        let class = b"zcode-account-manager\0ZCodeAccountManager\0";
+        conn.change_property(
+            PropMode::REPLACE,
+            window,
+            wm_class,
+            string_type,
+            8,
+            class.len() as u32,
+            class,
+        )
+        .map_err(xerr)?;
+        // WM_NAME 用 ASCII 兜底（Latin-1），_NET_WM_NAME 用 UTF-8 显示中文标题
+        let name = b"ZCode Account Manager\0";
+        conn.change_property(
+            PropMode::REPLACE,
+            window,
+            wm_name,
+            string_type,
+            8,
+            name.len() as u32,
+            name,
+        )
+        .map_err(xerr)?;
+        let mut titled = "ZCode 账户管家".as_bytes().to_vec();
+        titled.push(0);
+        conn.change_property(
+            PropMode::REPLACE,
+            window,
+            net_wm_name,
+            utf8_string,
+            8,
+            titled.len() as u32,
+            &titled,
+        )
+        .map_err(xerr)?;
+        Ok(())
+    }
+
+    /// 获取一个有效的 X 服务器时间戳（System Tray 规范要求 dock 消息
+    /// data.l[0] 为真实时间戳）。标准技巧：对根窗口监听属性变更并追加
+    /// 一个空属性，PropertyNotify 事件里携带服务器时间。
+    fn server_timestamp(conn: &RustConnection, root: Window) -> Result<u32, String> {
+        fn xerr<E: std::fmt::Display>(error: E) -> String {
+            error.to_string()
+        }
+        let scratch = conn
+            .intern_atom(false, b"ZCODE_TRAY_TIMESTAMP")
+            .map_err(xerr)?
+            .reply()
+            .map_err(xerr)?
+            .atom;
+        conn.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )
+        .map_err(xerr)?;
+        // 追加 0 个元素：不改变任何属性内容，只为收到带时间戳的 PropertyNotify
+        conn.change_property(PropMode::APPEND, root, scratch, scratch, 32, 0, &[])
+            .map_err(xerr)?;
+        conn.flush().map_err(xerr)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut timestamp = 0u32;
+        while std::time::Instant::now() < deadline {
+            while let Some(event) = conn.poll_for_event().map_err(xerr)? {
+                if let x11rb::protocol::Event::PropertyNotify(ev) = event {
+                    if ev.atom == scratch {
+                        timestamp = ev.time;
+                    }
+                }
+            }
+            if timestamp != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // 事件掩码是各客户端的并集，恢复本连接的选择不会影响其他客户端
+        conn.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT),
+        )
+        .map_err(xerr)?;
+        Ok(timestamp)
+    }
+
+    /// 图标被托盘收养后的事件循环：尺寸变化时重绘图标，点击唤起主窗口；
+    /// 图标窗口被托盘销毁或退回根窗口时干净退出线程。
+    fn tray_event_loop(
+        conn: &RustConnection,
+        ctx: &egui::Context,
+        root: Window,
+        depth: u8,
+        window: Window,
+        icon: &SourceIcon,
+    ) -> Result<(), String> {
+        fn xerr<E: std::fmt::Display>(error: E) -> String {
+            error.to_string()
+        }
         let gc: u32 = conn.generate_id().map_err(xerr)?;
         conn.create_gc(gc, window, &CreateGCAux::new())
             .map_err(xerr)?;
         let mut current_size = 0u32;
+        // 收养后立即可按当前几何绘制一次，托盘不一定再发 Resize
+        if let Ok(geometry) = conn.get_geometry(window).map_err(xerr)?.reply() {
+            let size = geometry.width.min(geometry.height) as u32;
+            if size > 0 {
+                current_size = size;
+                draw_icon(conn, depth, window, gc, icon, size).map_err(xerr)?;
+            }
+        }
         loop {
             let event = conn.wait_for_event().map_err(xerr)?;
             match event {
@@ -438,12 +624,24 @@ mod imp {
                     let size = ev.width.min(ev.height) as u32;
                     if size > 0 && size != current_size {
                         current_size = size;
-                        draw_icon(&conn, screen.root_depth, window, gc, &icon, size)
-                            .map_err(xerr)?;
+                        draw_icon(conn, depth, window, gc, icon, size).map_err(xerr)?;
                     }
                 }
                 x11rb::protocol::Event::ButtonPress(ev) if ev.event == window => {
-                    crate::single_instance::bring_to_front(&ctx);
+                    crate::single_instance::bring_to_front(ctx);
+                }
+                // 托盘插件退出/被移除时图标窗口可能被退回根窗口：主动销毁并退出，
+                // 避免再次游离成“无标题窗口”
+                x11rb::protocol::Event::ReparentNotify(ev)
+                    if ev.window == window && ev.parent == root =>
+                {
+                    let _ = conn.destroy_window(window);
+                    let _ = conn.flush();
+                    return Ok(());
+                }
+                // 托盘销毁了图标窗口（面板重启等）：直接结束线程
+                x11rb::protocol::Event::DestroyNotify(ev) if ev.window == window => {
+                    return Ok(());
                 }
                 _ => {}
             }
