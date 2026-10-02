@@ -374,6 +374,100 @@ fn set_active_account(roots: &Roots, id: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+/// 备份数据目录下的一个文件：相对 `data/` 目录的路径与字节大小。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupFile {
+    pub path: String,
+    pub size: u64,
+}
+
+/// 在线查看/编辑备份文件允许的最大文本大小。
+pub const BACKUP_TEXT_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 递归列出备份 `data/` 目录下的全部文件，按路径排序。
+/// ZCode 与 CLI 工具的备份目录布局一致，共用此实现。
+pub fn list_backup_files(profile: &AccountProfile) -> Result<Vec<BackupFile>, String> {
+    let data = profile.directory.join("data");
+    let mut files = Vec::new();
+    if data.is_dir() {
+        collect_backup_files(&data, "", &mut files)?;
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+fn collect_backup_files(
+    dir: &Path,
+    prefix: &str,
+    out: &mut Vec<BackupFile>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let relative = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let metadata = entry.metadata().map_err(|error| error.to_string())?;
+        if metadata.is_dir() {
+            collect_backup_files(&entry.path(), &relative, out)?;
+        } else {
+            out.push(BackupFile {
+                path: relative,
+                size: metadata.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// 校验备份内的相对路径（只允许 `data/` 下的常规相对路径，防止越出备份目录），
+/// 返回绝对路径。
+fn backup_file_path(profile: &AccountProfile, relative: &str) -> Result<PathBuf, String> {
+    if relative.contains('\\') || relative.contains('\0') {
+        return Err("非法文件路径".into());
+    }
+    let mut path = profile.directory.join("data");
+    for part in relative.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err("非法文件路径".into());
+        }
+        path.push(part);
+    }
+    Ok(path)
+}
+
+/// 读取备份内的文本文件用于在线查看/编辑；二进制或超过大小限制时返回中文错误说明。
+pub fn read_backup_file(profile: &AccountProfile, relative: &str) -> Result<String, String> {
+    let path = backup_file_path(profile, relative)?;
+    let metadata = fs::metadata(&path).map_err(|error| format!("读取文件失败: {error}"))?;
+    if !metadata.is_file() {
+        return Err("该路径不是文件".into());
+    }
+    if metadata.len() > BACKUP_TEXT_MAX_BYTES {
+        return Err(format!(
+            "文件超过 {} MB，不支持在线查看",
+            BACKUP_TEXT_MAX_BYTES / 1024 / 1024
+        ));
+    }
+    let bytes = fs::read(&path).map_err(|error| format!("读取文件失败: {error}"))?;
+    String::from_utf8(bytes).map_err(|_| "该文件是二进制文件，无法以文本方式查看".into())
+}
+
+/// 把在线编辑后的内容写回备份内的文件（只影响备份，不改动当前登录状态）。
+pub fn write_backup_file(
+    profile: &AccountProfile,
+    relative: &str,
+    content: &str,
+) -> Result<(), String> {
+    let path = backup_file_path(profile, relative)?;
+    if !path.is_file() {
+        return Err("备份内不存在该文件".into());
+    }
+    fs::write(path, content).map_err(|error| format!("写入文件失败: {error}"))
+}
+
 pub fn open_accounts_folder(roots: &Roots) -> Result<(), String> {
     let root = accounts_root(roots);
     fs::create_dir_all(&root).map_err(|error| error.to_string())?;
@@ -617,5 +711,102 @@ mod tests {
     #[test]
     fn new_account_ids_do_not_collide() {
         assert_ne!(new_account_id(), new_account_id());
+    }
+
+    /// 手工构造一个备份目录布局（manifest + data/...），用于文件级接口测试。
+    fn synthetic_profile(temp: &TempDir, name: &str) -> AccountProfile {
+        let directory = temp.path().join(name);
+        let data = directory.join("data");
+        fs::create_dir_all(data.join("sessions").join("store")).unwrap();
+        fs::write(data.join("credentials"), b"token-123").unwrap();
+        fs::write(
+            data.join("sessions").join("store").join("db.sqlite"),
+            [0u8, 159, 146, 150],
+        )
+        .unwrap();
+        fs::write(
+            directory.join("manifest.json"),
+            r#"{"version":1,"id":"synthetic","name":"合成","created_at":1,"updated_at":2,"item_count":2}"#,
+        )
+        .unwrap();
+        AccountProfile {
+            directory,
+            manifest: AccountManifest {
+                version: 1,
+                id: "synthetic".into(),
+                name: "合成".into(),
+                alias: None,
+                phone: None,
+                identity: None,
+                fingerprint: None,
+                created_at: 1,
+                updated_at: 2,
+                item_count: 2,
+            },
+        }
+    }
+
+    #[test]
+    fn backup_files_list_read_and_write() {
+        let temp = TempDir::new().unwrap();
+        let profile = synthetic_profile(&temp, "account-x");
+
+        let files = list_backup_files(&profile).unwrap();
+        assert_eq!(
+            files,
+            vec![
+                BackupFile {
+                    path: "credentials".into(),
+                    size: 9,
+                },
+                BackupFile {
+                    path: "sessions/store/db.sqlite".into(),
+                    size: 4,
+                },
+            ],
+            "应递归列出 data 下全部文件并按路径排序"
+        );
+
+        assert_eq!(
+            read_backup_file(&profile, "credentials").unwrap(),
+            "token-123"
+        );
+        assert!(
+            read_backup_file(&profile, "sessions/store/db.sqlite").is_err(),
+            "二进制文件应拒绝在线查看"
+        );
+
+        write_backup_file(&profile, "credentials", "token-456").unwrap();
+        assert_eq!(
+            read_backup_file(&profile, "credentials").unwrap(),
+            "token-456"
+        );
+        assert!(
+            write_backup_file(&profile, "manifest.json", "{}").is_err(),
+            "manifest 不在 data 目录内，不允许通过文件接口改写"
+        );
+    }
+
+    #[test]
+    fn backup_file_paths_reject_traversal() {
+        let temp = TempDir::new().unwrap();
+        let profile = synthetic_profile(&temp, "account-y");
+
+        for evil in [
+            "../manifest.json",
+            "a/../../escape",
+            "/etc/passwd",
+            "creds\\..\\creds",
+            "",
+            "a//b",
+            ".",
+            "..",
+        ] {
+            assert!(
+                read_backup_file(&profile, evil).is_err()
+                    && write_backup_file(&profile, evil, "x").is_err(),
+                "路径 {evil:?} 应被拒绝"
+            );
+        }
     }
 }

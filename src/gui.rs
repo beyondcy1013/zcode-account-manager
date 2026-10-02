@@ -1,7 +1,8 @@
 use crate::{
     accounts::{
-        active_account, delete_account, list_accounts, open_accounts_folder, save_current_account,
-        set_alias, set_phone, switch_account, AccountProfile,
+        active_account, delete_account, list_accounts, list_backup_files, open_accounts_folder,
+        read_backup_file, save_current_account, set_alias, set_phone, switch_account,
+        write_backup_file, AccountProfile, BackupFile,
     },
     auto_send::{self, AutoSendRequest, SendSteps},
     candidate_by_tag, claude, clean, cli_accounts, clipboard, codebuddy, codex, gemini,
@@ -105,6 +106,31 @@ struct TransferExportState {
     json: String,
     error: Option<String>,
     save_path: String,
+}
+
+/// 备份详情窗口状态：列出某账号备份内的全部文件，可逐个查看/编辑内容。
+struct BackupDetailState {
+    /// 备份所属：ZCode 主账号页或某个 CLI 工具页（按 TOOL_STORES 下标）。
+    target: TransferTarget,
+    account_id: String,
+    /// 展示名，用于窗口标题。
+    name: String,
+    /// data 目录下全部文件（打开窗口时扫描一次，保存后原地更新大小）。
+    files: Vec<BackupFile>,
+    /// 当前打开的文件编辑器。
+    editor: Option<BackupFileEditor>,
+}
+
+/// 备份内单个文件的查看/编辑状态。
+struct BackupFileEditor {
+    /// 相对 data 目录的路径。
+    path: String,
+    /// 编辑框内容。
+    content: String,
+    /// 打开（或上次保存）时的内容，用于判断是否有未保存修改。
+    saved: String,
+    /// 无法在线查看/编辑的原因（二进制、过大等）；None 表示可编辑。
+    readonly_reason: Option<String>,
 }
 
 /// 后台慢速刷新的结果（进程探测、ZCode CLI 账号识别、CLI 会话探测），
@@ -256,6 +282,8 @@ pub struct ZCodeApp {
     transfer_import: Option<TransferImportState>,
     /// 账号导出窗口（所有账号类型共用）。
     transfer_export: Option<TransferExportState>,
+    /// 备份详情窗口（所有账号类型共用，含单文件编辑器）。
+    backup_detail: Option<BackupDetailState>,
     /// 「刷新登录」后的新凭据观察任务，同一时间只跟踪一个账号。
     relogin_watch: Option<ReloginWatch>,
 }
@@ -315,6 +343,7 @@ impl ZCodeApp {
             gemini_login: None,
             transfer_import: None,
             transfer_export: None,
+            backup_detail: None,
             relogin_watch: None,
         };
         app.refresh();
@@ -584,6 +613,31 @@ impl ZCodeApp {
                 self.set_error(error);
                 false
             }
+        }
+    }
+
+    /// 打开备份详情窗口：扫描该备份 data 目录下的全部文件供逐个查看/编辑。
+    fn open_backup_detail(&mut self, target: TransferTarget, id: &str) {
+        let profile = match target {
+            TransferTarget::ZCode => self.profile(id),
+            TransferTarget::Tool(index) => self.tools.get(index).and_then(|tool| tool.profile(id)),
+        };
+        let Some(profile) = profile else {
+            self.set_error("目标账号不存在");
+            return;
+        };
+        let name = profile.manifest.display_name().to_string();
+        match list_backup_files(&profile) {
+            Ok(files) => {
+                self.backup_detail = Some(BackupDetailState {
+                    target,
+                    account_id: id.to_string(),
+                    name,
+                    files,
+                    editor: None,
+                });
+            }
+            Err(error) => self.set_error(error),
         }
     }
 
@@ -1178,6 +1232,13 @@ impl ZCodeApp {
                                 });
                             }
                             if ui
+                                .button("详情")
+                                .on_hover_text("查看该备份内的全部文件，可在线查看/编辑文件内容")
+                                .clicked()
+                            {
+                                self.open_backup_detail(TransferTarget::ZCode, &id);
+                            }
+                            if ui
                                 .add_enabled(is_active, egui::Button::new("更新"))
                                 .on_hover_text(
                                     "用当前登录状态更新此备份；仅当前正在使用的账户可以更新",
@@ -1430,6 +1491,13 @@ impl ZCodeApp {
                                     id: id.clone(),
                                     alias: profile.manifest.alias.clone().unwrap_or_default(),
                                 });
+                            }
+                            if ui
+                                .button("详情")
+                                .on_hover_text("查看该备份内的全部文件，可在线查看/编辑文件内容")
+                                .clicked()
+                            {
+                                self.open_backup_detail(TransferTarget::Tool(tool_index), &id);
                             }
                             if ui
                                 .add_enabled(is_active, egui::Button::new("更新"))
@@ -1883,6 +1951,185 @@ impl ZCodeApp {
                 self.refresh();
             }
             Err(error) => self.set_error(error),
+        }
+    }
+
+    /// 备份详情窗口：列出备份 data 目录内的全部文件，逐个「编辑」查看内容。
+    /// 备份在窗口打开期间被删除时直接关闭窗口。
+    fn backup_detail_window(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.backup_detail.take() else {
+            return;
+        };
+        let profile = match state.target {
+            TransferTarget::ZCode => self.profile(&state.account_id),
+            TransferTarget::Tool(index) => self
+                .tools
+                .get(index)
+                .and_then(|tool| tool.profile(&state.account_id)),
+        };
+        let Some(profile) = profile else {
+            return;
+        };
+
+        let mut open = true;
+        egui::Window::new(format!("备份详情 - {}", state.name))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(640.0)
+            .default_height(420.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(profile.directory.to_string_lossy().as_ref())
+                        .monospace()
+                        .weak(),
+                );
+                let total: u64 = state.files.iter().map(|file| file.size).sum();
+                ui.label(format!(
+                    "共 {} 个文件，合计 {}",
+                    state.files.len(),
+                    format_size(total)
+                ));
+                ui.add_space(6.0);
+                if state.files.is_empty() {
+                    ui.label(RichText::new("该备份内没有文件。").weak());
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new("backup_detail_files")
+                            .striped(true)
+                            .min_col_width(40.0)
+                            .spacing([10.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.strong("文件路径");
+                                ui.strong("大小");
+                                ui.strong("操作");
+                                ui.end_row();
+                                for index in 0..state.files.len() {
+                                    let (path, size) = {
+                                        let file = &state.files[index];
+                                        (file.path.clone(), file.size)
+                                    };
+                                    cell_label(
+                                        ui,
+                                        &path,
+                                        400.0,
+                                        RichText::new(&path).monospace(),
+                                    );
+                                    ui.label(format_size(size));
+                                    if ui
+                                        .button("编辑")
+                                        .on_hover_text(
+                                            "查看/编辑该文件内容；修改只写入备份，不影响当前登录状态",
+                                        )
+                                        .clicked()
+                                    {
+                                        state.editor =
+                                            Some(match read_backup_file(&profile, &path) {
+                                                Ok(content) => BackupFileEditor {
+                                                    path: path.clone(),
+                                                    saved: content.clone(),
+                                                    content,
+                                                    readonly_reason: None,
+                                                },
+                                                Err(reason) => BackupFileEditor {
+                                                    path: path.clone(),
+                                                    saved: String::new(),
+                                                    content: String::new(),
+                                                    readonly_reason: Some(reason),
+                                                },
+                                            });
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+        if !open {
+            // 关闭详情窗口，连同尚未保存的文件编辑内容一并丢弃
+            return;
+        }
+        self.backup_file_editor_window(ctx, &profile, &mut state);
+        self.backup_detail = Some(state);
+    }
+
+    /// 备份详情窗口内单个文件的查看/编辑子窗口。
+    fn backup_file_editor_window(
+        &mut self,
+        ctx: &egui::Context,
+        profile: &AccountProfile,
+        state: &mut BackupDetailState,
+    ) {
+        let Some(mut editor) = state.editor.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut close_requested = false;
+        let mut save_requested = false;
+        egui::Window::new("编辑备份文件")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(620.0)
+            .default_height(420.0)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(&editor.path).monospace().weak());
+                ui.label(
+                    RichText::new("修改只写入该备份；下次切换或导出此账号时生效。")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(6.0);
+                if let Some(reason) = &editor.readonly_reason {
+                    ui.colored_label(Color32::from_rgb(190, 112, 28), reason);
+                } else {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut editor.content)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(16)
+                            .code_editor(),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let dirty =
+                        editor.readonly_reason.is_none() && editor.content != editor.saved;
+                    if dirty {
+                        ui.colored_label(Color32::from_rgb(190, 112, 28), "有未保存的修改");
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("关闭").clicked() {
+                            close_requested = true;
+                        }
+                        if ui
+                            .add_enabled(dirty, egui::Button::new("保存"))
+                            .clicked()
+                        {
+                            save_requested = true;
+                        }
+                    });
+                });
+            });
+        if close_requested {
+            open = false;
+        }
+        if save_requested {
+            match write_backup_file(profile, &editor.path, &editor.content) {
+                Ok(()) => {
+                    editor.saved.clone_from(&editor.content);
+                    let size = editor.content.len() as u64;
+                    if let Some(file) = state.files.iter_mut().find(|f| f.path == editor.path) {
+                        file.size = size;
+                    }
+                    self.set_ok(format!("已保存备份文件「{}」", editor.path));
+                }
+                Err(error) => self.set_error(error),
+            }
+        }
+        if open {
+            state.editor = Some(editor);
         }
     }
 
@@ -2630,6 +2877,7 @@ impl eframe::App for ZCodeApp {
         self.confirmation_window(&ctx);
         self.account_editor_window(&ctx);
         self.tool_editor_window(&ctx);
+        self.backup_detail_window(&ctx);
         self.gemini_login_window(&ctx);
         self.transfer_import_window(&ctx);
         self.transfer_export_window(&ctx);
@@ -2678,6 +2926,17 @@ fn format_timestamp(timestamp: u64) -> String {
         60..=3_599 => format!("{} 分钟前", elapsed / 60),
         3_600..=86_399 => format!("{} 小时前", elapsed / 3_600),
         _ => format!("{} 天前", elapsed / 86_400),
+    }
+}
+
+/// 文件大小的可读表示（B / KB / MB）。
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -2831,6 +3090,7 @@ mod tests {
             gemini_login: None,
             transfer_import: None,
             transfer_export: None,
+            backup_detail: None,
             relogin_watch: None,
         };
 
