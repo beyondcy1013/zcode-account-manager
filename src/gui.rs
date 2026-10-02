@@ -2,12 +2,12 @@ use crate::{
     accounts::{
         active_account, delete_account, list_accounts, list_backup_files, open_accounts_folder,
         read_backup_file, save_current_account, set_alias, set_phone, switch_account,
-        write_backup_file, AccountProfile, BackupFile,
+        write_backup_file, AccountProfile,
     },
     auto_send::{self, AutoSendRequest, SendSteps},
     candidate_by_tag, claude, clean, cli_accounts, clipboard, codebuddy, codex, gemini,
     launch_zcode, single_instance, terminate_zcode, transfer, tray, zcode_running, CleanOptions,
-    Roots, FULL_TAGS,
+    Roots, CANDIDATES, FULL_TAGS,
 };
 use eframe::egui::{self, Color32, RichText};
 use std::{
@@ -116,15 +116,27 @@ struct BackupDetailState {
     /// 展示名，用于窗口标题。
     name: String,
     /// data 目录下全部文件（打开窗口时扫描一次，保存后原地更新大小）。
-    files: Vec<BackupFile>,
+    files: Vec<BackupFileEntry>,
     /// 当前打开的文件编辑器。
     editor: Option<BackupFileEditor>,
 }
 
+/// 备份内一个文件的两种路径：存储路径用于读写，展示路径带真实文件名。
+struct BackupFileEntry {
+    /// 备份 data 目录下的存储路径；首段是备份标签（如 auth、credentials），
+    /// 文件/目录以标签名落盘，本身不带扩展名。
+    stored: String,
+    /// 还原后的原始相对路径（如 .codex/auth.json），真实文件名带扩展名。
+    display: String,
+    size: u64,
+}
+
 /// 备份内单个文件的查看/编辑状态。
 struct BackupFileEditor {
-    /// 相对 data 目录的路径。
-    path: String,
+    /// 相对 data 目录的存储路径（读写的键）。
+    stored: String,
+    /// 展示用的原始相对路径。
+    display: String,
     /// 编辑框内容。
     content: String,
     /// 打开（或上次保存）时的内容，用于判断是否有未保存修改。
@@ -616,6 +628,37 @@ impl ZCodeApp {
         }
     }
 
+    /// 把备份内的存储路径还原成原始相对路径：备份以标签名（无扩展名）
+    /// 落盘，如 `auth` 实为 `auth.json`、`credentials` 实为
+    /// `.zcode/v2/credentials.json`；目录标签保留内部真实文件名。
+    /// 旧版按原始路径存放的快照首段不是标签，原样返回。
+    fn stored_to_display_path(&self, target: TransferTarget, stored: &str) -> String {
+        let tag = stored.split('/').next().unwrap_or(stored);
+        let relative = match target {
+            TransferTarget::ZCode => CANDIDATES
+                .iter()
+                .find(|candidate| candidate.tag == tag)
+                .map(|candidate| candidate.relative),
+            TransferTarget::Tool(index) => self
+                .tools
+                .get(index)
+                .and_then(|tool| {
+                    tool.store
+                        .paths
+                        .iter()
+                        .find(|path| path.tag == tag)
+                        .map(|path| path.relative)
+                }),
+        };
+        match relative {
+            Some(relative) => {
+                let rest = stored.strip_prefix(tag).unwrap_or("");
+                format!("{relative}{rest}")
+            }
+            None => stored.to_string(),
+        }
+    }
+
     /// 打开备份详情窗口：扫描该备份 data 目录下的全部文件供逐个查看/编辑。
     fn open_backup_detail(&mut self, target: TransferTarget, id: &str) {
         let profile = match target {
@@ -629,6 +672,17 @@ impl ZCodeApp {
         let name = profile.manifest.display_name().to_string();
         match list_backup_files(&profile) {
             Ok(files) => {
+                let files = files
+                    .into_iter()
+                    .map(|file| {
+                        let display = self.stored_to_display_path(target, &file.path);
+                        BackupFileEntry {
+                            stored: file.path,
+                            display,
+                            size: file.size,
+                        }
+                    })
+                    .collect();
                 self.backup_detail = Some(BackupDetailState {
                     target,
                     account_id: id.to_string(),
@@ -2009,17 +2063,18 @@ impl ZCodeApp {
                                 ui.strong("操作");
                                 ui.end_row();
                                 for index in 0..state.files.len() {
-                                    let (path, size) = {
+                                    let (stored, display, size) = {
                                         let file = &state.files[index];
-                                        (file.path.clone(), file.size)
+                                        (file.stored.clone(), file.display.clone(), file.size)
                                     };
                                     cell_label(
                                         ui,
-                                        &path,
+                                        &display,
                                         360.0,
-                                        RichText::new(&path).monospace(),
-                                    );
-                                    let extension = file_extension(&path);
+                                        RichText::new(&display).monospace(),
+                                    )
+                                    .on_hover_text(format!("备份内存储路径：{stored}"));
+                                    let extension = file_extension(&display);
                                     if extension == "—" {
                                         ui.label(RichText::new("—").weak());
                                     } else {
@@ -2034,15 +2089,17 @@ impl ZCodeApp {
                                         .clicked()
                                     {
                                         state.editor =
-                                            Some(match read_backup_file(&profile, &path) {
+                                            Some(match read_backup_file(&profile, &stored) {
                                                 Ok(content) => BackupFileEditor {
-                                                    path: path.clone(),
+                                                    stored: stored.clone(),
+                                                    display: display.clone(),
                                                     saved: content.clone(),
                                                     content,
                                                     readonly_reason: None,
                                                 },
                                                 Err(reason) => BackupFileEditor {
-                                                    path: path.clone(),
+                                                    stored: stored.clone(),
+                                                    display: display.clone(),
                                                     saved: String::new(),
                                                     content: String::new(),
                                                     readonly_reason: Some(reason),
@@ -2082,7 +2139,7 @@ impl ZCodeApp {
             .default_width(620.0)
             .default_height(420.0)
             .show(ctx, |ui| {
-                ui.label(RichText::new(&editor.path).monospace().weak());
+                ui.label(RichText::new(&editor.display).monospace().weak());
                 ui.label(
                     RichText::new("修改只写入该备份；下次切换或导出此账号时生效。")
                         .small()
@@ -2123,14 +2180,18 @@ impl ZCodeApp {
             open = false;
         }
         if save_requested {
-            match write_backup_file(profile, &editor.path, &editor.content) {
+            match write_backup_file(profile, &editor.stored, &editor.content) {
                 Ok(()) => {
                     editor.saved.clone_from(&editor.content);
                     let size = editor.content.len() as u64;
-                    if let Some(file) = state.files.iter_mut().find(|f| f.path == editor.path) {
+                    if let Some(file) = state
+                        .files
+                        .iter_mut()
+                        .find(|file| file.stored == editor.stored)
+                    {
                         file.size = size;
                     }
-                    self.set_ok(format!("已保存备份文件「{}」", editor.path));
+                    self.set_ok(format!("已保存备份文件「{}」", editor.display));
                 }
                 Err(error) => self.set_error(error),
             }
@@ -3026,6 +3087,79 @@ mod tests {
         assert_eq!(file_extension("a/b/.env"), "—");
         assert_eq!(file_extension("archive.tar.gz"), ".gz");
         assert_eq!(file_extension("no_ext/"), "—");
+    }
+
+    #[test]
+    fn stored_paths_translate_to_original_relative_paths() {
+        let app = ZCodeApp {
+            roots: Roots {
+                user_profile: PathBuf::new(),
+                app_data: PathBuf::new(),
+            },
+            accounts: Vec::new(),
+            active_id: None,
+            current_identity: AccountIdentity::default(),
+            last_detected_identity: None,
+            account_name: String::new(),
+            auto_restart: true,
+            info_editor: None,
+            status: String::new(),
+            status_error: false,
+            page: Page::Accounts,
+            confirm: None,
+            auto_send_state: Arc::new(Mutex::new(AutoSendState::default())),
+            pinned_index: 1,
+            auto_message: String::new(),
+            test_click_session: false,
+            test_input: false,
+            test_send: false,
+            schedule_enabled: false,
+            schedule_time: String::new(),
+            schedule_daily: false,
+            schedule_cancel: Arc::new(Mutex::new(None)),
+            tools: TOOL_STORES
+                .iter()
+                .map(|store| ToolAccounts::new(store))
+                .collect(),
+            tool_page: 0,
+            zcode_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            refresh_shared: Arc::new(Mutex::new(None)),
+            refresh_seq: 0,
+            refreshing: false,
+            gemini_login: None,
+            transfer_import: None,
+            transfer_export: None,
+            backup_detail: None,
+            relogin_watch: None,
+        };
+
+        // ZCode：标签还原为真实相对路径，文件名带扩展名
+        assert_eq!(
+            app.stored_to_display_path(TransferTarget::ZCode, "credentials"),
+            ".zcode/v2/credentials.json"
+        );
+        // 目录标签：内部文件保留真实层级，仅首段标签被还原
+        assert_eq!(
+            app.stored_to_display_path(
+                TransferTarget::ZCode,
+                "session_full/Sessions/123456.json"
+            ),
+            "ZCode/session/Sessions/123456.json"
+        );
+        // CLI 工具：auth → auth.json
+        assert_eq!(
+            app.stored_to_display_path(TransferTarget::Tool(1), "auth"),
+            "auth.json"
+        );
+        assert_eq!(
+            app.stored_to_display_path(TransferTarget::Tool(1), "config"),
+            "config.toml"
+        );
+        // 旧版按原始路径存放的快照：首段不是标签，原样返回
+        assert_eq!(
+            app.stored_to_display_path(TransferTarget::Tool(1), "auth.json"),
+            "auth.json"
+        );
     }
 
     #[test]
