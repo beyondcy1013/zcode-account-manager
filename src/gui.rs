@@ -2004,6 +2004,7 @@ impl ZCodeApp {
                             .spacing([10.0, 6.0])
                             .show(ui, |ui| {
                                 ui.strong("文件路径");
+                                ui.strong("类型");
                                 ui.strong("大小");
                                 ui.strong("操作");
                                 ui.end_row();
@@ -2015,9 +2016,15 @@ impl ZCodeApp {
                                     cell_label(
                                         ui,
                                         &path,
-                                        400.0,
+                                        360.0,
                                         RichText::new(&path).monospace(),
                                     );
+                                    let extension = file_extension(&path);
+                                    if extension == "—" {
+                                        ui.label(RichText::new("—").weak());
+                                    } else {
+                                        ui.label(RichText::new(&extension).monospace());
+                                    }
                                     ui.label(format_size(size));
                                     if ui
                                         .button("编辑")
@@ -2940,6 +2947,15 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// 从备份内相对路径提取扩展名（含点）；无扩展名或 `.xxx` 形式的隐藏文件返回 “—”。
+fn file_extension(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => format!(".{ext}"),
+        _ => "—".into(),
+    }
+}
+
 /// 表格单元格：始终单行显示，超出列宽截断，悬停可查看完整内容。
 fn cell_label(ui: &mut egui::Ui, text: &str, max_width: f32, styled: RichText) -> egui::Response {
     ui.add_sized([max_width, 20.0], egui::Label::new(styled).truncate())
@@ -2999,6 +3015,17 @@ mod tests {
             .as_secs();
         assert_eq!(format_timestamp(now), "刚刚");
         assert_eq!(format_timestamp(now - 120), "2 分钟前");
+    }
+
+    #[test]
+    fn file_extension_extraction() {
+        assert_eq!(file_extension("credentials"), "—");
+        assert_eq!(file_extension("settings.json"), ".json");
+        assert_eq!(file_extension("sessions/store/db.sqlite"), ".sqlite");
+        assert_eq!(file_extension(".hidden"), "—");
+        assert_eq!(file_extension("a/b/.env"), "—");
+        assert_eq!(file_extension("archive.tar.gz"), ".gz");
+        assert_eq!(file_extension("no_ext/"), "—");
     }
 
     #[test]
